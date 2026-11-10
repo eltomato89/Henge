@@ -14,6 +14,7 @@ struct SettingsView: View {
     @AppStorage(EngineTuning.fastFlushKey) private var fastFlush = true
     @AppStorage(EngineTuning.wfiSpinKey) private var wfiSpin = false
     @AppStorage(EngineTuning.superblocksKey) private var superblocks = false
+    @AppStorage(Microphone.key) private var microphone = false
     @AppStorage(JITBootstrap.codeCacheKey) private var codeCacheMB = JITBootstrap.defaultCodeCacheMB
 
     /// The second footer paragraph: how you click, given the selected input mode.
@@ -100,6 +101,19 @@ struct SettingsView: View {
                     }
                     .listRowBackground(Desk.card)
                 }
+                Section("Sound") {
+                    Toggle("Microphone", isOn: $microphone)
+                        .onChange(of: microphone) { on in
+                            if on {
+                                Microphone.requestPermission { _ in Microphone.configureSession() }
+                            } else {
+                                Microphone.configureSession()
+                            }
+                        }
+                    Text("The Mac gets this device's microphone as a sound input. It is recorded only while an app on the Mac is listening. Without headphones the Mac can hear its own sound. Applies the next time a Mac starts.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
+                .listRowBackground(Desk.card)
                 Section("Performance") {
                     Picker("Mac refresh rate", selection: $refreshRate) {
                         Text("30 Hz").tag(30)

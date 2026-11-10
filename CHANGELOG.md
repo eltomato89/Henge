@@ -6,6 +6,12 @@ Every change keeps its original author in the git history.
 
 ## Unreleased
 
+### Microphone
+- Settings > Sound > Microphone gives the Mac this device's microphone: the virtual sound card
+  (`devices/virtio_snd.c`) offers an input stream, filled from a RemoteIO input unit
+  (`host/audio_mac.c`). Off by default, and then the sound card is output only, as before.
+  `HV_MIC=2` in `henge-env.txt` offers a stereo stream instead of mono. Not yet run on a device.
+
 ### The screen is a Magic Trackpad 2
 - The session's trackpad is no longer a relative mouse: the engine presents it to the Mac as
   a Magic Trackpad 2 (Apple's vendor multitouch format) on the xHCI USB bus, so the guest's

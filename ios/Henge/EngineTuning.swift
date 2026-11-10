@@ -24,6 +24,8 @@ enum EngineTuning {
         if [30, 120].contains(d.integer(forKey: refreshKey)) { env["HV_HZ"] = String(d.integer(forKey: refreshKey)) }
         if d.bool(forKey: superblocksKey) { env["HV_SUPERBLOCKS"] = "1" } else { unsetenv("HV_SUPERBLOCKS") }
         if d.bool(forKey: wfiSpinKey) { env["HV_WFI_SPIN"] = "50" }
+        // The Mac's sound card gets an input stream only while the microphone setting is on (Microphone.swift).
+        if Microphone.isOn { env["HV_MIC"] = "1" } else { unsetenv("HV_MIC") }
         if d.object(forKey: fastFlushKey) as? Bool == false { env["HV_FLUSH"] = "0" }
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         // GPU command trace: on while Documents/trace-on exists (it is checked every frame, so it can be toggled live).

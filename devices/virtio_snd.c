@@ -25,6 +25,7 @@
 #define S_BAD_MSG 0x8001
 #define S_NOT_SUPP 0x8002
 
+#define CHMAP_MONO 2
 #define CHMAP_FL 3
 #define CHMAP_FR 4
 
@@ -55,11 +56,137 @@ static void put32(uint8_t *p, uint32_t v) {
     memcpy(p, &v, 4);
 }
 
+/* ---- the input stream (HV_MIC=1) ---- */
+
+/* Hand a capture buffer back: `bytes` of PCM at the start of its writable part, the status in its last 8 bytes. */
+static void give_rx(HvVirtioSnd *d, const HvVirtqElem *e, uint32_t status, uint32_t bytes, uint32_t latency) {
+    HvVirtio *v = &d->vio;
+    uint32_t w = hv_virtq_writable(e);
+    uint8_t st[8];
+    put32(st, status);
+    put32(st + 4, latency);
+    if (w >= 8) hv_virtq_write(v, e, w - 8, st, 8);
+    hv_virtq_push(v, RXQ, e, w >= 8 ? bytes + 8 : 0);
+}
+
+static void put_zero(HvVirtio *v, const HvVirtqElem *e, uint32_t off, uint32_t len) {
+    static const uint8_t zero[1024];
+    while (len) {
+        uint32_t n = len > sizeof zero ? (uint32_t)sizeof zero : len;
+        hv_virtq_write(v, e, off, zero, n);
+        off += n;
+        len -= n;
+    }
+}
+
+/* Fill waiting capture buffers, oldest first, while the microphone has delivered enough for a whole one. */
+static int fill_rx(HvVirtioSnd *d) {
+    HvVirtio *v = &d->vio;
+    int any = 0;
+    while (d->in_running && d->in_head != d->in_tail) {
+        HvVirtqElem *e = &d->in_pending[d->in_head % HV_VSND_PENDING];
+        uint32_t w = hv_virtq_writable(e), cap = w > 8 ? w - 8 : 0;
+        if (d->in_frame_bytes) cap -= cap % d->in_frame_bytes;
+        uint32_t need = cap > HV_VSND_IN_RING / 2 ? HV_VSND_IN_RING / 2 : cap; /* a buffer the ring cannot hold: the rest is silence */
+        uint64_t c = atomic_load_explicit(&d->in_consumed, memory_order_relaxed);
+        uint64_t wr = atomic_load_explicit(&d->in_written, memory_order_acquire);
+        if (wr - c < need) break;
+        if (d->in_live) {
+            uint32_t off = 0;
+            while (off < need) {
+                uint32_t at = (uint32_t)((c + off) % HV_VSND_IN_RING), n = need - off;
+                if (n > HV_VSND_IN_RING - at) n = HV_VSND_IN_RING - at;
+                hv_virtq_write(v, e, off, d->in_ring + at, n);
+                off += n;
+            }
+            put_zero(v, e, need, cap - need);
+        } else {
+            put_zero(v, e, 0, cap);
+        }
+        atomic_store_explicit(&d->in_consumed, c + need, memory_order_release);
+        give_rx(d, e, S_OK, cap, (uint32_t)(wr - c - need));
+        d->in_head++;
+        d->in_xfers++;
+        any = 1;
+    }
+    return any;
+}
+
+/* Take the capture buffers the guest has offered. Returns 1 if any went back (the caller interrupts). */
+static int take_rx(HvVirtioSnd *d) {
+    HvVirtio *v = &d->vio;
+    int any = 0;
+    if (!(v->status & 4) || !v->q[RXQ].enabled) return 0;
+    while (d->in_tail - d->in_head < HV_VSND_PENDING) {
+        HvVirtqElem *e = &d->in_pending[d->in_tail % HV_VSND_PENDING];
+        if (hv_virtq_pop(v, RXQ, e) <= 0) break;
+        uint32_t stream = ~0u;
+        hv_virtq_read(v, e, 0, &stream, 4);
+        if (stream != 1 || !d->in_prepared) {
+            give_rx(d, e, S_BAD_MSG, 0, 0);
+            any = 1;
+            continue;
+        }
+        d->in_tail++;
+    }
+    return any | fill_rx(d);
+}
+
+static void in_halt(HvVirtioSnd *d) {
+    if (d->in_running && d->in_live && d->backend.in_stop) d->backend.in_stop(d->backend.opaque);
+    d->in_live = 0;
+    d->in_running = 0;
+}
+
+/* The input stream's PCM requests. */
+static uint32_t control_in(HvVirtioSnd *d, uint32_t code, const uint8_t *req) {
+    switch (code) {
+    case R_PCM_SET_PARAMS: {
+        unsigned ch = req[20], fmt = req[21], rate = req[22];
+        if (ch != (unsigned)d->mic || (fmt != HV_VSND_FMT_S16 && fmt != HV_VSND_FMT_S32 && fmt != HV_VSND_FMT_FLOAT) ||
+            (rate != HV_VSND_RATE_44100 && rate != HV_VSND_RATE_48000) || d->in_running)
+            return S_NOT_SUPP;
+        d->in_channels = ch;
+        d->in_format = fmt;
+        d->in_rate_hz = rate == HV_VSND_RATE_44100 ? 44100 : 48000;
+        d->in_frame_bytes = ch * format_bytes(fmt);
+        return S_OK;
+    }
+    case R_PCM_PREPARE:
+        if (!d->in_frame_bytes) return S_BAD_MSG;
+        d->in_prepared = 1;
+        return S_OK;
+    case R_PCM_START:
+        if (!d->in_prepared) return S_BAD_MSG;
+        if (!d->in_running) {
+            /* Nothing is recording yet, so both ends of the ring are this thread's: start it empty. */
+            atomic_store(&d->in_consumed, atomic_load(&d->in_written));
+            d->in_live = d->backend.in_start &&
+                         d->backend.in_start(d->backend.opaque, d->in_channels, d->in_format, d->in_rate_hz) == 0;
+            d->in_clock_ns = now_ns();
+            d->in_running = 1;
+            fprintf(stderr, "hengevm: sound: microphone %s (%u ch, format %u, %u Hz)\n",
+                    d->in_live ? "recording" : "not available, the Mac hears silence", d->in_channels, d->in_format, d->in_rate_hz);
+        }
+        return S_OK;
+    case R_PCM_STOP:
+        in_halt(d);
+        return S_OK;
+    default: /* R_PCM_RELEASE: every buffer still held goes back now (the spec requires it) */
+        in_halt(d);
+        d->in_prepared = 0;
+        for (; d->in_head != d->in_tail; d->in_head++) give_rx(d, &d->in_pending[d->in_head % HV_VSND_PENDING], S_OK, 0, 0);
+        return S_OK;
+    }
+}
+
 /* ---- control queue ---- */
 
 static uint32_t control(HvVirtioSnd *d, const HvVirtqElem *e) {
     HvVirtio *v = &d->vio;
-    uint8_t req[32] = {0}, resp[4 + 32];
+    uint8_t req[32] = {0}, resp[4 + 2 * 32];
+    uint32_t n = d->mic ? 2 : 1; /* streams, jacks and channel maps: the output's, then the input's */
+    int answered = 0;
     uint32_t got = hv_virtq_read(v, e, 0, req, sizeof req);
     uint32_t code, status = S_OK, rlen = 4;
     memcpy(&code, req, 4);
@@ -70,38 +197,51 @@ static uint32_t control(HvVirtioSnd *d, const HvVirtqElem *e) {
     memcpy(&size, req + 12, 4);
     stream = start; /* virtio_snd_pcm_hdr: stream_id at the same place */
     if (got < 4) code = 0;
-    switch (code) {
+    if (d->mic && got >= 8 && stream == 1 && code >= R_PCM_SET_PARAMS && code <= R_PCM_STOP) {
+        status = control_in(d, code, req);
+        answered = 1;
+    }
+    if (!answered) switch (code) {
     case R_PCM_INFO:
     case R_CHMAP_INFO:
-        if (start != 0 || count != 1 || size == 0 || size > 32) {
+    case R_JACK_INFO: /* a line-out jack, and with the input stream a microphone; always connected */
+        if (count < 1 || start >= n || count > n - start || size == 0 || size > 32) {
             status = S_BAD_MSG;
             break;
         }
-        if (code == R_PCM_INFO) {
-            uint64_t formats = 1ull << HV_VSND_FMT_S16 | 1ull << HV_VSND_FMT_S32 | 1ull << HV_VSND_FMT_FLOAT;
-            uint64_t rates = 1ull << HV_VSND_RATE_44100 | 1ull << HV_VSND_RATE_48000;
-            memcpy(resp + 4 + 8, &formats, 8);
-            memcpy(resp + 4 + 16, &rates, 8);
-            resp[4 + 24] = 0; /* output */
-            resp[4 + 25] = 1; /* channels min */
-            resp[4 + 26] = 2; /* channels max */
-        } else {
-            resp[4 + 4] = 0; /* output */
-            resp[4 + 5] = 2;
-            resp[4 + 6] = CHMAP_FL;
-            resp[4 + 7] = CHMAP_FR;
+        for (uint32_t i = 0; i < count; i++) {
+            uint8_t info[32] = {0};
+            int input = start + i == 1;
+            if (code == R_PCM_INFO) {
+                uint64_t formats = 1ull << HV_VSND_FMT_S16 | 1ull << HV_VSND_FMT_S32 | 1ull << HV_VSND_FMT_FLOAT;
+                uint64_t rates = 1ull << HV_VSND_RATE_44100 | 1ull << HV_VSND_RATE_48000;
+                memcpy(info + 8, &formats, 8);
+                memcpy(info + 16, &rates, 8);
+                info[24] = (uint8_t)input;              /* direction: 0 output, 1 input */
+                info[25] = input ? (uint8_t)d->mic : 1; /* channels min */
+                info[26] = input ? (uint8_t)d->mic : 2; /* channels max */
+            } else if (code == R_CHMAP_INFO) {
+                info[4] = (uint8_t)input;
+                if (input && d->mic == 1) {
+                    info[5] = 1;
+                    info[6] = CHMAP_MONO;
+                } else {
+                    info[5] = 2;
+                    info[6] = CHMAP_FL;
+                    info[7] = CHMAP_FR;
+                }
+            } else if (input) {
+                put32(info + 8, 0x90a00020); /* HDA pin default config: built-in microphone */
+                put32(info + 12, 0x20);      /* pin capabilities: input */
+                info[16] = 1;                /* connected */
+            } else {
+                put32(info + 8, 0x01014010); /* HDA pin default config: line out, rear, green jack */
+                put32(info + 12, 0x10);      /* pin capabilities: output */
+                info[16] = 1;                /* connected */
+            }
+            memcpy(resp + 4 + i * size, info, size);
         }
-        rlen = 4 + size;
-        break;
-    case R_JACK_INFO: /* one line-out jack, always connected */
-        if (start != 0 || count != 1 || size == 0 || size > 32) {
-            status = S_BAD_MSG;
-            break;
-        }
-        put32(resp + 4 + 8, 0x01014010); /* HDA pin default config: line out, rear, green jack */
-        put32(resp + 4 + 12, 0x10);      /* pin capabilities: output */
-        resp[4 + 16] = 1;                /* connected */
-        rlen = 4 + size;
+        rlen = 4 + count * size;
         break;
     case R_JACK_REMAP:
         break;
@@ -244,6 +384,22 @@ void hv_virtio_snd_poll(HvVirtioSnd *d) {
         hv_virtio_interrupt(v);
         take_tx(d); /* room for more */
     }
+    if (!d->mic) return;
+    if (d->in_running && d->in_frame_bytes) {
+        uint64_t w = atomic_load(&d->in_written), c = atomic_load(&d->in_consumed);
+        if (!d->in_live) { /* no host microphone: silence falls due at the stream's rate by the wall clock */
+            uint64_t now = now_ns(), frames = (now - d->in_clock_ns) * d->in_rate_hz / 1000000000ull;
+            if (frames) {
+                w += frames * d->in_frame_bytes;
+                d->in_clock_ns += frames * 1000000000ull / d->in_rate_hz;
+                atomic_store(&d->in_written, w);
+            }
+        }
+        /* The guest has no buffer waiting: keep a tenth of a second at most, so what it records next is not old. */
+        uint64_t keep = (uint64_t)d->in_rate_hz / 10 * d->in_frame_bytes;
+        if (d->in_head == d->in_tail && w - c > keep) atomic_store(&d->in_consumed, w - keep);
+    }
+    if (take_rx(d)) hv_virtio_interrupt(v);
 }
 
 uint32_t hv_virtio_snd_pull(HvVirtioSnd *d, void *buf, uint32_t len) {
@@ -267,6 +423,24 @@ uint32_t hv_virtio_snd_pull(HvVirtioSnd *d, void *buf, uint32_t len) {
     return n;
 }
 
+void hv_virtio_snd_push(HvVirtioSnd *d, const void *buf, uint32_t len) {
+    uint64_t w = atomic_load_explicit(&d->in_written, memory_order_relaxed);
+    uint64_t c = atomic_load_explicit(&d->in_consumed, memory_order_acquire);
+    if (!d->in_ring || len > HV_VSND_IN_RING || w - c + len > HV_VSND_IN_RING) { /* the guest is behind: this much is lost */
+        d->in_dropped++;
+        return;
+    }
+    uint32_t off = 0;
+    while (off < len) {
+        uint32_t at = (uint32_t)((w + off) % HV_VSND_IN_RING), k = len - off;
+        if (k > HV_VSND_IN_RING - at) k = HV_VSND_IN_RING - at;
+        memcpy(d->in_ring + at, (const uint8_t *)buf + off, k);
+        off += k;
+    }
+    atomic_store_explicit(&d->in_written, w + len, memory_order_release);
+    hv_machine_wake(d->vio.m);
+}
+
 static void notify(HvVirtio *v, int q) {
     HvVirtioSnd *d = v->dev;
     static HvVirtqElem e;
@@ -280,6 +454,8 @@ static void notify(HvVirtio *v, int q) {
         hv_virtio_snd_poll(d); /* a release may have freed buffers */
     } else if (q == TXQ) {
         take_tx(d);
+    } else if (q == RXQ && d->mic) {
+        if (take_rx(d)) hv_virtio_interrupt(v);
     } else if (q == RXQ) { /* no input stream: hand capture buffers straight back */
         int any = 0;
         while (hv_virtq_pop(v, q, &e) > 0) {
@@ -299,7 +475,14 @@ HvVirtioSnd *hv_virtio_snd_create(HvMachine *m, HvPcie *bus) {
     hv_virtio_init(v, m, 25, 0x040100, 4, 0); /* sound device, multimedia audio */
     v->dev = d;
     v->notify = notify;
-    uint32_t jacks = 1, streams = 1, chmaps = 1;
+    /* HV_MIC=1 (or 2, for a stereo stream): the Mac gets a microphone, the host's. Off, the device is output only. */
+    const char *mic = getenv("HV_MIC");
+    d->mic = mic ? (*mic == '2' ? 2 : *mic == '1' ? 1 : 0) : 0;
+    if (d->mic) {
+        d->in_ring = calloc(1, HV_VSND_IN_RING);
+        fprintf(stderr, "hengevm: sound: input stream offered (%d ch)\n", d->mic);
+    }
+    uint32_t jacks = d->mic ? 2 : 1, streams = jacks, chmaps = jacks;
     memcpy(v->config, &jacks, 4);
     memcpy(v->config + 4, &streams, 4);
     memcpy(v->config + 8, &chmaps, 4);
