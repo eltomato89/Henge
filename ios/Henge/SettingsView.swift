@@ -1,6 +1,8 @@
 import SwiftUI
 
 struct SettingsView: View {
+    private enum Page: Hashable { case keyboard }
+
     @ObservedObject private var jit = JITCoordinator.shared
     @AppStorage(JITCoordinator.autoEnableKey) private var jitAtLaunch = false
     @AppStorage(HardwareMouse.speedKey) private var mouseSpeed = 1.0
@@ -10,7 +12,6 @@ struct SettingsView: View {
     @AppStorage(VolumeClicks.modeKey) private var volumeMode = VolumeClicks.Mode.delayHold
     @AppStorage(VolumeClicks.swapKey) private var swapButtons = false
     @AppStorage(PhysicalMouseButtons.swapKey) private var swapMouseButtons = false
-    @AppStorage(HardwareShortcutMapper.enabledKey) private var controlMacShortcuts = false
     @AppStorage(EngineTuning.refreshKey) private var refreshRate = 60
     @AppStorage(EngineTuning.fastFlushKey) private var fastFlush = true
     @AppStorage(EngineTuning.wfiSpinKey) private var wfiSpin = false
@@ -61,10 +62,8 @@ struct SettingsView: View {
                         .font(.footnote).foregroundStyle(.secondary)
                 }
                 .listRowBackground(Desk.card)
-                Section("Keyboard") {
-                    Toggle("Use Control for Mac shortcuts", isOn: $controlMacShortcuts)
-                    Text("On a physical keyboard, Control-Tab switches Mac apps and Control-Q quits the current Mac app. Hold Control and press Tab again to cycle; add Shift to cycle backwards.")
-                        .font(.footnote).foregroundStyle(.secondary)
+                Section {
+                    NavigationLink("Keyboard", value: Page.keyboard)
                 }
                 .listRowBackground(Desk.card)
                 if Device.isPad {
@@ -135,6 +134,35 @@ struct SettingsView: View {
             .scrollContentBackground(.hidden)
             .background(Desk.page)
             .navigationTitle("Settings")
+            .navigationDestination(for: Page.self) { page in
+                switch page {
+                case .keyboard: KeyboardSettingsView()
+                }
+            }
         }
+    }
+}
+
+private struct KeyboardSettingsView: View {
+    @AppStorage(HardwareShortcutMapper.Shortcut.appSwitcher.defaultsKey) private var appSwitcher = false
+    @AppStorage(HardwareShortcutMapper.Shortcut.quit.defaultsKey) private var quit = false
+    @AppStorage(HardwareShortcutMapper.Shortcut.spotlight.defaultsKey) private var spotlight = false
+
+    var body: some View {
+        Form {
+            Section {
+                Toggle("Control-Tab to switch apps", isOn: $appSwitcher)
+                Toggle("Control-Q to quit the current app", isOn: $quit)
+                Toggle("Control-Space for Spotlight", isOn: $spotlight)
+            } header: {
+                Text("Mac Shortcuts")
+            } footer: {
+                Text("Use Control in place of Command on a physical keyboard. Hold Control and press Tab again to cycle through apps. Add Shift to cycle backwards. iOS may use Control-Space to switch keyboards.")
+            }
+            .listRowBackground(Desk.card)
+        }
+        .scrollContentBackground(.hidden)
+        .background(Desk.page)
+        .navigationTitle("Keyboard")
     }
 }

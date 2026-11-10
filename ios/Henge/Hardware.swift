@@ -63,7 +63,7 @@ enum Device {
     static let chipTooOldText = "macOS won't run on this \(name). Henge needs an A14 or M1 chip or newer."
 }
 
-/// A keyboard attached to the device. iOS reports each key by its HID usage, which the Mac's USB keyboard takes.
+/// A physical keyboard. iOS and the Mac's USB keyboard use the same HID codes for each key.
 enum HardwareKeys {
     private static var mapper = HardwareShortcutMapper()
     private static var lastKey: CFTimeInterval = 0
@@ -87,14 +87,18 @@ enum HardwareKeys {
             if aModifier != bModifier { return down ? aModifier : !aModifier }
             return aCode < bCode
         }
+        let defaults = UserDefaults.standard
         for press in ordered {
             guard let raw = press.key?.keyCode.rawValue, raw >= 0x04, raw <= 0xe7 else {
                 rest.insert(press)
                 continue
             }
             let usage = UInt8(raw)
-            let enabled = UserDefaults.standard.bool(forKey: HardwareShortcutMapper.enabledKey)
-            for event in mapper.event(usage, down: down, enabled: enabled) {
+            let events = mapper.event(usage, down: down) { shortcut in
+                // The keys above the on-screen keyboard can already be holding a modifier in the Mac.
+                StickyKeys.shared.down.isEmpty && defaults.bool(forKey: shortcut.defaultsKey)
+            }
+            for event in events {
                 henge_vm_key_hid(event.usage, event.down ? 1 : 0)
             }
             if usage < 0xe0 { lastKey = CACurrentMediaTime() }
