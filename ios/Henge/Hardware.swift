@@ -63,16 +63,15 @@ enum Device {
     static let chipTooOldText = "macOS won't run on this \(name). Henge needs an A14 or M1 chip or newer."
 }
 
-/// A keyboard attached to the device. iOS reports each key going down and coming up by its HID usage,
-/// which is what the Mac's USB keyboard sends, so every key and modifier goes straight across.
+/// A keyboard attached to the device. iOS reports each key by its HID usage, which the Mac's USB keyboard takes.
 enum HardwareKeys {
-    private static var held: Set<UInt8> = []
+    private static var mapper = HardwareShortcutMapper()
     private static var lastKey: CFTimeInterval = 0
 
     /// With the on-screen keyboard's view holding the keyboard, iOS may also offer a hardware key as
     /// text, and again as it repeats. The Mac has the key already, and repeats it itself.
     static var keyJustPressed: Bool {
-        held.contains { $0 < 0xe0 } || CACurrentMediaTime() - lastKey < 0.1
+        mapper.hasHeldKey || CACurrentMediaTime() - lastKey < 0.1
     }
 
     /// Sends the presses that are keys, and returns the rest.
@@ -94,14 +93,12 @@ enum HardwareKeys {
                 continue
             }
             let usage = UInt8(raw)
-            henge_vm_key_hid(usage, down ? 1 : 0)
-            if usage < 0xe0 { lastKey = CACurrentMediaTime() }
-            if down {
-                held.insert(usage)
-            } else {
-                held.remove(usage)
-                if usage < 0xe0 { StickyKeys.shared.releaseAll() } // one key after a tap on ⌃, ⌥ or ⌘
+            let enabled = UserDefaults.standard.bool(forKey: HardwareShortcutMapper.enabledKey)
+            for event in mapper.event(usage, down: down, enabled: enabled) {
+                henge_vm_key_hid(event.usage, event.down ? 1 : 0)
             }
+            if usage < 0xe0 { lastKey = CACurrentMediaTime() }
+            if !down && usage < 0xe0 { StickyKeys.shared.releaseAll() } // one key after a tap on ⌃, ⌥ or ⌘
         }
         return rest
     }
@@ -109,8 +106,7 @@ enum HardwareKeys {
     /// iPadOS can keep a key's release when it takes over, as it does for ⌘-Tab: the Mac must not
     /// go on thinking the key is down.
     static func releaseAll() {
-        for usage in held { henge_vm_key_hid(usage, 0) }
-        held.removeAll()
+        for event in mapper.releaseAll() { henge_vm_key_hid(event.usage, 0) }
     }
 }
 

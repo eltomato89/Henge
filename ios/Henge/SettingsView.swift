@@ -10,6 +10,7 @@ struct SettingsView: View {
     @AppStorage(VolumeClicks.modeKey) private var volumeMode = VolumeClicks.Mode.delayHold
     @AppStorage(VolumeClicks.swapKey) private var swapButtons = false
     @AppStorage(PhysicalMouseButtons.swapKey) private var swapMouseButtons = false
+    @AppStorage(HardwareShortcutMapper.enabledKey) private var controlMacShortcuts = false
     @AppStorage(EngineTuning.refreshKey) private var refreshRate = 60
     @AppStorage(EngineTuning.fastFlushKey) private var fastFlush = true
     @AppStorage(EngineTuning.wfiSpinKey) private var wfiSpin = false
@@ -57,6 +58,12 @@ struct SettingsView: View {
                     Text(Entitlements.increasedMemory
                          ? "A Mac's memory is kept out of this limit once JIT is on. If iOS refuses that, it uses free storage instead."
                          : "This install isn't signed with the increased memory limit entitlement. Reinstall Henge with a certificate that has it. Export your Mac first if the reinstall replaces the app's data.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
+                .listRowBackground(Desk.card)
+                Section("Keyboard") {
+                    Toggle("Use Control for Mac shortcuts", isOn: $controlMacShortcuts)
+                    Text("On a physical keyboard, Control-Tab switches Mac apps and Control-Q quits the current Mac app. Hold Control and press Tab again to cycle; add Shift to cycle backwards.")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
                 .listRowBackground(Desk.card)

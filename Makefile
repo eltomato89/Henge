@@ -214,3 +214,11 @@ $(B)/test_jit_advice: ios/Henge/JIT/JITNetworkAdvice.swift tests/test_jit_advice
 test-jit-advice: $(B)/test_jit_advice
 	$(B)/test_jit_advice
 .PHONY: test-jit-advice
+
+# Physical keyboard shortcut mapping and focus-loss cleanup, without an iOS device.
+$(B)/test_hardware_shortcuts: ios/Henge/HardwareShortcutMapper.swift tests/test_hardware_shortcuts.swift | $(B)
+	xcrun --sdk macosx swiftc $^ -o $@
+
+test-hardware-shortcuts: $(B)/test_hardware_shortcuts
+	$(B)/test_hardware_shortcuts
+.PHONY: test-hardware-shortcuts
