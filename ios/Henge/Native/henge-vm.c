@@ -318,6 +318,11 @@ void henge_vm_touch_button(int down) {
     hv_vm_touch_button(down);
     pthread_rwlock_unlock(&api_lock);
 }
+void henge_vm_battery(int percent, int charging, int ac) {
+    if (!lock_running()) return;
+    hv_vm_battery(percent, charging, ac);
+    pthread_rwlock_unlock(&api_lock);
+}
 void henge_vm_set_display_layer(void *layer) {
     /* vm.c serializes this with unpublishing the old display before free.
        Main-thread layer detachment need not wait for disk/GPU teardown. */

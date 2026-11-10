@@ -82,6 +82,8 @@ void hv_vm_mouse_hwheel(int dx);
 void hv_vm_touch(int id, int phase, int x, int y, uint32_t ts_ms);
 void hv_vm_touch_frame(uint32_t ts_ms); /* commit one frame with every finger that moved */
 void hv_vm_touch_button(int down); /* the pad's full press (a click) */
+/* The host's battery, which the Mac sees as a UPS (devices/xhci.h, hv_xhci_battery). */
+void hv_vm_battery(int percent, int charging, int ac);
 /* Where the guest has its pointer, in display pixels. 0, or -1 before it has one. */
 int hv_vm_pointer(int *x, int *y);
 /* A small picture of the display, BGRA, width * height * 4 bytes. 0, or -1 before anything shows. */

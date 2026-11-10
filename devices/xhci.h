@@ -6,15 +6,16 @@
 #include "pcie.h"
 
 /* An xHCI USB host controller (xHCI 1.0, one interrupter, 32-byte contexts,
-   INTx) with two USB HID devices: a boot keyboard on port 1 and a Magic
-   Trackpad 2 on port 2: what Virtualization.framework gives a macOS guest as
+   INTx) with three USB HID devices: a boot keyboard on port 1, a Magic
+   Trackpad 2 on port 2 and, on port 3, a HID power device (a UPS) that carries the
+   host's battery, so macOS shows the iPad's charge as a UPS battery: what Virtualization.framework gives a macOS guest as
    its "Virtual USB Keyboard", plus Apple's multitouch pad, so the guest's
    own gesture engine sees a real trackpad. Changes come from the host UI on
    any thread (hv_xhci_key, hv_xhci_touch); the CPU thread delivers them
    (hv_xhci_poll). */
 #define HV_XHCI_SLOTS 8
-#define HV_XHCI_PORTS 2
-#define HV_XHCI_DEVICES 2
+#define HV_XHCI_PORTS 3
+#define HV_XHCI_DEVICES 3
 #define HV_XHCI_INTRS 4
 #define HV_XHCI_EPS 32 /* device context index 1..31 */
 #define HV_XHCI_REPORTS 256
@@ -52,7 +53,7 @@ typedef struct HvXhci {
     /* device slots: -1 until the device on the slot's port is addressed */
     int slot_used[HV_XHCI_SLOTS + 1];
     struct HvXhciSlot {
-        int dev;         /* 0 keyboard, 1 trackpad, -1 none */
+        int dev;         /* 0 keyboard, 1 trackpad, 2 battery (UPS), -1 none */
         int configured;
         HvXhciRing ep[HV_XHCI_EPS];
         int ep_running[HV_XHCI_EPS];
@@ -83,6 +84,10 @@ typedef struct HvXhci {
     uint32_t tp_multi_logs; /* multi-finger deliveries logged, capped */
     uint8_t tp_f1[8];   /* feature report 1: the header for the selected sensor register */
     int tp_f1_len;
+    /* The battery: what the host reports, and the input reports (by ID bit) still to send. */
+    int bat_percent;   /* 0..100 */
+    int bat_charging, bat_ac;
+    uint32_t bat_pending;
 } HvXhci;
 
 HvXhci *hv_xhci_create(HvMachine *m, HvPcie *bus);
@@ -102,6 +107,9 @@ void hv_xhci_touch(HvXhci *x, int id, int phase, int px, int py, uint32_t ts_ms)
 void hv_xhci_touch_frame(HvXhci *x, uint32_t ts_ms);
 /* Any thread: the pad's full press (a click), down or up. */
 void hv_xhci_touch_button(HvXhci *x, int down);
+/* Any thread: the host's battery. percent 0..100; charging: the battery is filling;
+   ac: on external power (charging or full). macOS sees it as a UPS's battery. */
+void hv_xhci_battery(HvXhci *x, int percent, int charging, int ac);
 /* CPU thread: hand waiting reports to the guest. */
 void hv_xhci_poll(HvXhci *x);
 

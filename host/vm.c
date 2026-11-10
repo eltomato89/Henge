@@ -569,6 +569,7 @@ void hv_vm_touch(int id, int phase, int x, int y, uint32_t ts_ms) {
 void hv_vm_touch_frame(uint32_t ts_ms) { hv_xhci_touch_frame(board.usb, ts_ms); }
 
 void hv_vm_touch_button(int down) { hv_xhci_touch_button(board.usb, down); }
+void hv_vm_battery(int percent, int charging, int ac) { hv_xhci_battery(board.usb, percent, charging, ac); }
 
 int hv_vm_pointer(int *x, int *y) {
     HvPvgLite *pvg = atomic_load_explicit(&display_pvg, memory_order_acquire);

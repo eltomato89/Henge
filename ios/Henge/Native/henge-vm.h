@@ -76,6 +76,8 @@ void henge_vm_mouse_scroll(int dx, int dy);
 void henge_vm_touch(int finger, int phase, int x, int y, uint32_t ts_ms);
 void henge_vm_touch_frame(uint32_t ts_ms); /* commit one frame with every finger that moved */
 void henge_vm_touch_button(int down); /* the pad's full press (a click) */
+/* This device's battery, which the Mac sees as a UPS: percent 0..100, charging, on external power. */
+void henge_vm_battery(int percent, int charging, int ac);
 /* Where the guest has its pointer, in display pixels. 0, or -1 before it has one. */
 int henge_vm_pointer(int *x, int *y);
 /* A small picture of the display, BGRA, width * height * 4 bytes. 0, or -1 before anything shows. */

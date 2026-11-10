@@ -126,6 +126,48 @@ static const uint8_t tp_config_desc[34] = {
 
 static const char *const tp_strings[] = {NULL, "Apple Inc.", "Magic Trackpad 2", "HengeVM"};
 
+/* Port 3: a USB HID power device, a UPS (Power Device page 0x84, Battery System page 0x85),
+   which macOS's own UPS support reads with no driver: the host's battery shows in the Mac's
+   menu bar and Battery settings. Three reports, each also readable with GET_REPORT:
+     1  RemainingCapacity, percent (input and feature)
+     2  PresentStatus: Charging, Discharging, ACPresent, BatteryPresent (input and feature)
+     3  CapacityMode (2: percent), DesignCapacity, FullChargeCapacity (100), Rechargeable (feature) */
+static const uint8_t bat_report_desc[] = {
+    0x05, 0x84, 0x09, 0x04, 0xa1, 0x01,       /* usage page (power device), usage (UPS), collection (application) */
+    0x09, 0x24, 0xa1, 0x02,                   /* usage (power summary), collection (logical) */
+    0x05, 0x85,                               /* usage page (battery system) */
+    0x85, 0x01,                               /* report ID 1 */
+    0x15, 0x00, 0x25, 0x64, 0x75, 0x08, 0x95, 0x01,
+    0x09, 0x66, 0x81, 0x02,                   /* remaining capacity: input */
+    0x09, 0x66, 0xb1, 0x02,                   /* remaining capacity: feature */
+    0x85, 0x02,                               /* report ID 2 */
+    0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x04,
+    0x09, 0x44, 0x09, 0x45, 0x09, 0xd0, 0x09, 0xd1, 0x81, 0x02, /* charging, discharging, AC present, battery present: input */
+    0x95, 0x04, 0x81, 0x01,                   /* padding */
+    0x95, 0x04,
+    0x09, 0x44, 0x09, 0x45, 0x09, 0xd0, 0x09, 0xd1, 0xb1, 0x02, /* the same: feature */
+    0x95, 0x04, 0xb1, 0x01,                   /* padding */
+    0x85, 0x03,                               /* report ID 3 */
+    0x15, 0x00, 0x25, 0x64, 0x75, 0x08, 0x95, 0x04,
+    0x09, 0x2c, 0x09, 0x83, 0x09, 0x67, 0x09, 0x8b, 0xb1, 0x02, /* capacity mode, design and full capacity, rechargeable */
+    0xc0, 0xc0,
+};
+
+static const uint8_t bat_device_desc[18] = {
+    18, 1, 0x00, 0x02, 0, 0, 0, 64, /* USB 2.0, class per interface, EP0 64 bytes */
+    0x09, 0x12, 0x01, 0x00,         /* vendor 0x1209 (pid.codes), product 0x0001 */
+    0x00, 0x01, 1, 2, 3, 1,         /* bcdDevice 1.00, strings 1-3, one configuration */
+};
+
+static const uint8_t bat_config_desc[34] = {
+    9, 2, 34, 0, 1, 1, 0, 0xc0, 0,            /* one interface, self-powered */
+    9, 4, 0, 0, 1, 3, 0, 0, 0,                /* interface 0: HID, no boot protocol */
+    9, 0x21, 0x11, 0x01, 0, 1, 0x22, sizeof bat_report_desc, 0, /* HID 1.11, one report descriptor */
+    7, 5, 0x81, 3, 8, 0, 10,                  /* EP1 IN, interrupt, 8 bytes, every 10 ms */
+};
+
+static const char *const bat_strings[] = {NULL, "HengeVM", "iPad Battery", "1"};
+
 struct HvXhciDev {
     const char *const *strings;
     const uint8_t *device_desc;
@@ -136,6 +178,7 @@ struct HvXhciDev {
 static const struct HvXhciDev devs[HV_XHCI_DEVICES] = {
     {kbd_strings, kbd_device_desc, kbd_config_desc, kbd_report_desc, sizeof kbd_report_desc},
     {tp_strings, tp_device_desc, tp_config_desc, tp_report_desc, sizeof tp_report_desc},
+    {bat_strings, bat_device_desc, bat_config_desc, bat_report_desc, sizeof bat_report_desc},
 };
 
 static int xlog(void) {
@@ -316,6 +359,29 @@ static void tp_select(HvXhci *x, int reg) {
     x->tp_f1_len = 5;
 }
 
+/* The battery's report with this ID, report ID first; 0 for one it doesn't have.
+   Called with x->mu held or from the CPU thread (plain ints, read once). */
+static int bat_report(HvXhci *x, int rid, uint8_t *out) {
+    switch (rid) {
+    case 1:
+        out[0] = 1;
+        out[1] = (uint8_t)x->bat_percent;
+        return 2;
+    case 2:
+        out[0] = 2;
+        out[1] = (uint8_t)((x->bat_charging ? 1 : 0) | (x->bat_ac ? 0 : 2) | (x->bat_ac ? 4 : 0) | 8);
+        return 2;
+    case 3:
+        out[0] = 3;
+        out[1] = 2;   /* capacity mode: percent */
+        out[2] = 100; /* design capacity */
+        out[3] = 100; /* full charge capacity */
+        out[4] = 1;   /* rechargeable */
+        return 5;
+    default: return 0;
+    }
+}
+
 /* Answer a SETUP on endpoint 0. Returns the reply length (data to send for IN
    requests), or -1 to stall. */
 static int control(HvXhci *x, int slot, const uint8_t setup[8], uint8_t *out, int max) {
@@ -373,7 +439,13 @@ static int control(HvXhci *x, int slot, const uint8_t setup[8], uint8_t *out, in
         src = tmp, len = 1;
     } else if (type == 0xa1 && req == 1) { /* GET_REPORT: wValue is (type << 8) | report ID */
         if (x->slots[slot].dev == 0) src = x->state, len = 8;
-        else {
+        else if (x->slots[slot].dev == 2) {
+            pthread_mutex_lock(&x->mu);
+            len = bat_report(x, value & 0xff, tmp);
+            pthread_mutex_unlock(&x->mu);
+            if (!len) return -1;
+            src = tmp;
+        } else {
             int rtype = value >> 8, rid = value & 0xff;
             if (rtype == 3) { /* feature: the sensor-configuration registers */
                 if (rid == 0x01) { /* the header for the register just selected */
@@ -505,6 +577,21 @@ static void run_ep_in(HvXhci *x, int slot) {
             wr(x, buf, x->reports[x->rhead % HV_XHCI_REPORTS], n);
             x->rhead++;
             x->delivered++;
+            transfer_event(x, at, n < want ? CC_SHORT_PACKET : CC_SUCCESS, want - n, slot, dci);
+        }
+    } else if (s->dev == 2) {
+        while (x->bat_pending && ring_peek(x, r, trb, &at)) {
+            int type = (trb[3] >> 10) & 0x3f;
+            ring_advance(r);
+            if (type != TRB_NORMAL) continue;
+            int rid = __builtin_ctz(x->bat_pending);
+            x->bat_pending &= ~(1u << rid);
+            uint8_t rep[8];
+            uint32_t len = (uint32_t)bat_report(x, rid, rep);
+            uint64_t buf = (uint64_t)trb[1] << 32 | trb[0];
+            uint32_t want = trb[2] & 0x1ffff;
+            uint32_t n = want < len ? want : len;
+            wr(x, buf, rep, n);
             transfer_event(x, at, n < want ? CC_SHORT_PACKET : CC_SUCCESS, want - n, slot, dci);
         }
     } else {
@@ -701,10 +788,10 @@ static void run_commands(HvXhci *x) {
 /* ---- ports ---- */
 
 /* Port 1 is the full-speed keyboard; port 2 is the high-speed trackpad, as the real
-   Magic Trackpad 2 is. */
+   Magic Trackpad 2 is; port 3 is the full-speed battery. */
 static void port_connect(HvXhci *x) {
     for (int p = 0; p < HV_XHCI_PORTS; p++) {
-        x->portsc[p] = PORT_PP | PORT_CCS | PORT_CSC | (uint32_t)(p ? SPEED_HIGH : SPEED_FULL) << PORT_SPEED_SHIFT | 7u << PORT_PLS_SHIFT;
+        x->portsc[p] = PORT_PP | PORT_CCS | PORT_CSC | (uint32_t)(p == 1 ? SPEED_HIGH : SPEED_FULL) << PORT_SPEED_SHIFT | 7u << PORT_PLS_SHIFT;
         port_event(x, p);
     }
 }
@@ -760,8 +847,9 @@ static void reset(HvXhci *x) {
     x->tp_db = 0;
     x->tp_multi_logs = 0;
     x->tp_f1_len = 0;
+    x->bat_pending = 1u << 1 | 1u << 2; /* the first battery reports go out once the guest polls */
     for (int p = 0; p < HV_XHCI_PORTS; p++)
-        x->portsc[p] = PORT_PP | PORT_CCS | PORT_CSC | (uint32_t)(p ? SPEED_HIGH : SPEED_FULL) << PORT_SPEED_SHIFT | 7u << PORT_PLS_SHIFT;
+        x->portsc[p] = PORT_PP | PORT_CCS | PORT_CSC | (uint32_t)(p == 1 ? SPEED_HIGH : SPEED_FULL) << PORT_SPEED_SHIFT | 7u << PORT_PLS_SHIFT;
     update_irq(x);
 }
 
@@ -789,7 +877,7 @@ static uint64_t bar_read(HvPciDev *d, int bar, uint64_t off, unsigned size) {
         if (size == 8 && i + 1 < 8) v |= (uint64_t)cap[i + 1] << 32;
         v >>= 8 * (off & 3);
     } else if (off >= XECP && off < XECP + 16) { /* Supported Protocol: USB 2.0 on every port */
-        static const uint32_t ext[4] = {2u | 0x0200u << 16, 0x20425355, 1u | ((1u << HV_XHCI_PORTS) - 1u) << 8, 0};
+        static const uint32_t ext[4] = {2u | 0x0200u << 16, 0x20425355, 1u | (uint32_t)HV_XHCI_PORTS << 8, 0};
         uint32_t i = (uint32_t)(off - XECP) / 4;
         v = ext[i];
         if (size == 8 && i + 1 < 4) v |= (uint64_t)ext[i + 1] << 32;
@@ -1112,6 +1200,20 @@ void hv_xhci_touch_button(HvXhci *x, int down) {
     hv_machine_wake(x->m);
 }
 
+void hv_xhci_battery(HvXhci *x, int percent, int charging, int ac) {
+    if (!x) return;
+    if (percent < 0) percent = 0;
+    if (percent > 100) percent = 100;
+    pthread_mutex_lock(&x->mu);
+    if (x->bat_percent != percent) x->bat_pending |= 1u << 1;
+    if (x->bat_charging != !!charging || x->bat_ac != !!ac) x->bat_pending |= 1u << 2;
+    x->bat_percent = percent;
+    x->bat_charging = !!charging;
+    x->bat_ac = !!ac;
+    pthread_mutex_unlock(&x->mu);
+    hv_machine_wake(x->m);
+}
+
 void hv_xhci_poll(HvXhci *x) {
     if (!x) return;
     for (int slot = 1; slot <= HV_XHCI_SLOTS; slot++)
@@ -1124,6 +1226,8 @@ HvXhci *hv_xhci_create(HvMachine *m, HvPcie *bus) {
     pthread_mutex_init(&x->mu, NULL);
     /* QEMU's xHCI IDs. Class 0x0c0330 with revision 0: macOS's IOPCIClassMatch compares all 32 bits. */
     hv_pci_init(&x->pci, 0x1b36, 0x000d, 0x0c033000, 0x1af4, 0x1100);
+    x->bat_percent = 100; /* until the host says otherwise: full, on external power */
+    x->bat_ac = 1;
     x->pci.opaque = x;
     x->pci.bar_read = bar_read;
     x->pci.bar_write = bar_write;
