@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <strings.h>
 #include <sys/mount.h>
 #include <sys/socket.h>
@@ -305,6 +306,239 @@ static int local_path(const char *path, char *out, size_t cap) {
     return 0;
 }
 
+/* ---- what the guest must never be served ---- */
+
+/* Documents holds things that are the device's, not the Mac's. The inventory below is the
+   audit of every filename the host app itself reads, executes, follows, or writes
+   in Documents (citations are to the app sources; see the design record):
+     henge.log, henge-prev.log            HengeLog.swift:55,81 (the log and its previous run)
+     henge-native.log, henge-native-prev.log
+                                          HengeLog.swift:116,120,149,150 (native stderr capture,
+                                          replayed into the next run's henge.log)
+     henge-env.txt                        EngineTuning.swift:41 (parsed KEY=VALUE, applied via
+                                          setenv before each Mac starts: engine control)
+     trace-on                             EngineTuning.swift:39-40 (its mere existence at the
+                                          HV_PVG_TRACE_FILE path enables the GPU trace,
+                                          checked with access(F_OK) in pvg_lite.c / pvg_metal.m)
+     henge-autopilot.txt                  Autopilot.swift:41 (followed line by line as commands)
+     henge-autopilot-once.txt             Autopilot.swift:33 (renamed to henge-autopilot.txt at
+                                          launch and followed: a one-shot command plant)
+     StikJIT (directory component)        JITSetup.swift:42 (the pairing directory)
+     pairingFile.plist                    JITSetup.swift:44 (the JIT pairing file itself; it was
+                                          previously covered only transitively, and only in
+                                          exact case, by the StikJIT component above)
+   The pairingFile-<UUID>.plist pattern (HengeJITHelper.swift:36) is denied too: the helper
+   writes those under Library, not Documents, so this is defence in depth for copies.
+   When the served root is Documents itself, or any folder containing these, they are not
+   listed, read, written, or deleted through the share: a request for one answers 404, as
+   if it were not there. The default Documents/Shared root contains none of them, so this
+   changes nothing there.
+   This is defence in depth, not a guarantee: it cannot see hardlinks, and the machine-import
+   inbox (Machines.swift:144,154: any Documents folder holding disk.img, machine.json,
+   auxiliary.bin and AVPBooter.vmapple2.bin is adopted) cannot be closed by filename without
+   also denying the Exports the app itself writes for the user to copy out. */
+/* ASCII case-insensitive component equality. The host filesystem is case-insensitive by
+   default, so an exact-case match is a bypass (HENGE.LOG is henge.log to the disk but was
+   not to the old check). The fold here is ASCII only, tolower() per byte, and that is NOT
+   the whole defence: the host volume folds some non-ASCII spellings onto these ASCII
+   names too (filesystem probes read one file through its U+017F long-s and U+212A
+   Kelvin-sign spellings), so a non-ASCII lookalike CAN be the same file to the
+   filesystem, and therefore to the app. What closes those spellings is not this fold:
+   resolved_local() canonicalises with realpath(), which returns the on-disk spelling,
+   and re-runs this deny over the resolved path's root-relative components, so a folded
+   spelling arrives at the check already canonicalised to the denied name. The
+   resolved-path re-check is the load-bearing defence for non-ASCII folds; it must not
+   be removed as redundant with this request-path fold. */
+static int component_denied(const char *part, size_t len) {
+    static const char *names[] = {"henge.log", "henge-prev.log", "henge-native.log", "henge-native-prev.log",
+                                  "henge-env.txt", "trace-on", "henge-autopilot.txt", "henge-autopilot-once.txt",
+                                  "StikJIT", "pairingFile.plist"};
+    for (size_t i = 0; i < sizeof names / sizeof names[0]; i++) {
+        if (strlen(names[i]) != len) continue;
+        size_t j = 0;
+        while (j < len && tolower((unsigned char)part[j]) == tolower((unsigned char)names[i][j])) j++;
+        if (j == len) return 1;
+    }
+    /* pairingFile-<UUID>.plist, any case (see the inventory note above). */
+    static const char pre[] = "pairingfile-", suf[] = ".plist";
+    if (len > sizeof pre - 1 + sizeof suf - 1) {
+        size_t j = 0;
+        while (j < sizeof pre - 1 && tolower((unsigned char)part[j]) == pre[j]) j++;
+        if (j == sizeof pre - 1) {
+            size_t k = 0, off = len - (sizeof suf - 1);
+            while (k < sizeof suf - 1 && tolower((unsigned char)part[off + k]) == suf[k]) k++;
+            if (k == sizeof suf - 1) return 1;
+        }
+    }
+    return 0;
+}
+
+static int share_denied(const char *path) {
+    const char *p = path;
+    while (*p) {
+        while (*p == '/') p++;
+        if (!*p) break;
+        const char *end = strchr(p, '/');
+        size_t len = end ? (size_t)(end - p) : strlen(p);
+        if (component_denied(p, len)) return 1;
+        if (!end) break;
+        p = end;
+    }
+    return 0;
+}
+
+/* ---- resolved-path containment ----
+   SYMLINK POLICY (stated; the redesign's core decision):
+   - A symlink is followed only when its fully resolved target stays inside the served
+     root and is not itself a denied name. A link from inside the root to another place
+     inside the root therefore keeps working (it is ordinary served content), while any
+     link, at any depth, whose target leaves the root is refused for every method.
+   - The final component is treated the same as an intermediate one: the old code's
+     O_NOFOLLOW in do_get covered only the final component, so an intermediate symlink
+     escaped the root entirely. Resolution here is over the whole path.
+   - Creates differ from reads because the target may not exist yet: the deepest existing
+     ancestor is canonicalised with realpath() and the not-yet-existing remainder is
+     appended. A remainder component cannot be a symlink (it does not exist), so the
+     create lands inside the root exactly when its existing parent does. If the final
+     component DOES exist and is a symlink to an existing target, realpath() resolves it
+     and the outside/denied rules apply, so a PUT or MKCOL cannot be redirected out.
+   - A broken symlink (target missing) resolves as parent + its own name for reads:
+     reads fail at open as before. But "component absent" and "component present as a
+     dangling symlink" are different facts, and creates must not confuse them
+     because realpath() fails on a dangling link, so the loop
+     below strips it as if it were a not-yet-existing remainder, and a handler that
+     creates by opening the final path (LOCK's O_CREAT) then follows the link and
+     creates its target, possibly outside the root, possibly a denied
+     existence-checked name such as henge-autopilot-once.txt or trace-on.
+     resolved_local_create() therefore refuses any path with a dangling component
+     for the handlers that create through the final path (LOCK, MKCOL). The other
+     create-class handlers are safe by their own mechanism, wire-verified, and keep
+     their behaviour: PUT writes a temp file beside the target and renames it over
+     the final component, which replaces a dangling link itself inside the root and
+     never follows it; MOVE's rename has the same replace-the-link property at its
+     destination; COPY to a dangling destination fails inside copyfile (409) and
+     creates nothing. MKCOL goes through resolved_local_create() anyway, so its
+     refusal rests on this check, not on mkdir's EEXIST.
+   - Final-component link semantics follow POSIX link
+     semantics, per operation: DELETE removes the link itself, never its target, and
+     MOVE moves the link itself at both ends (a destination link is replaced, never
+     followed); recursion happens only into real directories. Intermediate
+     components still resolve under containment exactly as above. Reads (GET,
+     PROPFIND, PROPPATCH, and COPY's source) keep follow semantics for live in-root
+     links, as do PUT and COPY destinations (write-through to an in-root target;
+     refused when the target is outside or denied). A final link is an object
+     inside the root, so deleting or moving it touches nothing outside the root
+     whatever it points at: the target is never read, written, or removed by those
+     operations. Copying FROM a live symlink whose target is outside is refused
+     like any other outside resolution.
+   - A DELETE of a link whose path ends in a trailing slash is refused (403): the
+     trailing slash leaves no final component name for link-final resolution to
+     act on, so the request is declined rather than operated on. The refusal is
+     decided behavior (a trailing slash on a link is a malformed delete), not a
+     gap: the link is neither followed nor removed.
+   - The denylist is re-checked on the RESOLVED path's root-relative components, so an
+     innocently named link to a denied file (inside or outside the root) is refused.
+     The check is root-relative, never absolute, so a served root that happens to sit
+     under a folder named e.g. "trace-on" is not self-denied.
+   - Known residual: this is a check-then-use design. Between resolution and the syscall
+     a concurrent writer could swap a component for a symlink (the guest has no symlink
+     operation in this protocol, but MOVE can relocate a host-planted link). Closing that
+     race needs dirfd/openat-style traversal, which is a larger change than this redesign;
+     it is named here so the limit is on record, not discovered later.
+   Returns 0 with the canonical local path in out, or -1 to refuse. Refusals surface as
+   each handler's existing failure status (404 for reads, 403 for writes): no content or
+   metadata of an outside or denied target is ever served either way. */
+static int resolved_local(const char *path, char *out, size_t cap) {
+    char cand[PATH_MAX], work[PATH_MAX], canon[PATH_MAX], resolved[PATH_MAX];
+    char remainder[PATH_MAX] = "";
+    if (local_path(path, cand, sizeof cand) != 0) return -1;
+    snprintf(work, sizeof work, "%s", cand);
+    for (;;) {
+        if (realpath(work, canon)) {
+            int n = remainder[0] ? snprintf(resolved, sizeof resolved, "%s%s", canon, remainder)
+                                 : snprintf(resolved, sizeof resolved, "%s", canon);
+            if (n < 0 || (size_t)n >= sizeof resolved) return -1;
+            break;
+        }
+        if (errno != ENOENT && errno != ENOTDIR) return -1;
+        char *slash = strrchr(work, '/');
+        if (!slash || slash == work) return -1; /* reached the filesystem root without resolving */
+        char tail[PATH_MAX];
+        if (snprintf(tail, sizeof tail, "%s%s", slash, remainder) >= (int)sizeof tail) return -1;
+        snprintf(remainder, sizeof remainder, "%s", tail);
+        *slash = 0;
+    }
+    size_t rl = strlen(root);
+    int contained = !strcmp(resolved, root) || (rl == 1 && resolved[0] == '/') ||
+                    (!strncmp(resolved, root, rl) && resolved[rl] == '/');
+    if (!contained) return -1;
+    if (share_denied(!strcmp(resolved, root) ? "/" : resolved + rl)) return -1;
+    if ((size_t)snprintf(out, cap, "%s", resolved) >= cap) return -1;
+    return 0;
+}
+
+/* ---- dangling components and link-final resolution ---- */
+
+/* 1 when any component of cand (the unresolved root-join of a request path) exists as
+   a symlink whose target does not resolve: a dangling link, at any depth. realpath()
+   on the full path cannot see this case (it fails, and the strip loop in
+   resolved_local() treats the component as absent), so it is checked directly, one
+   prefix at a time. A live link, wherever it points, is not dangling: containment
+   and the deny re-check in resolved_local() judge live links. */
+static int has_dangling_component(const char *cand) {
+    char buf[PATH_MAX];
+    if (snprintf(buf, sizeof buf, "%s", cand) >= (int)sizeof buf) return 1;
+    for (char *p = buf + 1;; p++) {
+        if (*p != '/' && *p != 0) continue;
+        char save = *p;
+        *p = 0;
+        struct stat lst;
+        if (lstat(buf, &lst) == 0 && S_ISLNK(lst.st_mode)) {
+            char rp[PATH_MAX];
+            if (!realpath(buf, rp)) return 1;
+        }
+        if (!save) break;
+        *p = save;
+    }
+    return 0;
+}
+
+/* resolved_local() for create-class handlers that act through the final path (LOCK,
+   MKCOL): additionally refuse when any component of the requested path exists as a
+   dangling symlink, so a create can never be redirected through a broken link to a
+   target outside the root (or to a denied existence-checked name inside it). */
+static int resolved_local_create(const char *path, char *out, size_t cap) {
+    char cand[PATH_MAX];
+    if (local_path(path, cand, sizeof cand) != 0) return -1;
+    if (has_dangling_component(cand)) return -1;
+    return resolved_local(path, out, cap);
+}
+
+/* resolved_local() with POSIX final-component link semantics, for DELETE and for
+   MOVE at both ends: when the final component exists as a symlink, the result is
+   the link's own path (its parent resolved under the usual containment and deny
+   rules), never the link's target. Any other path resolves exactly as
+   resolved_local(). The final name is deny-checked here as a belt, because the
+   returned path is built from the request name, not resolved. */
+static int resolved_local_linkfinal(const char *path, char *out, size_t cap) {
+    char cand[PATH_MAX];
+    struct stat lst;
+    if (local_path(path, cand, sizeof cand) != 0) return -1;
+    if (lstat(cand, &lst) != 0 || !S_ISLNK(lst.st_mode)) return resolved_local(path, out, cap);
+    const char *slash = strrchr(path, '/');
+    if (!slash || !slash[1]) return -1;
+    if (component_denied(slash + 1, strlen(slash + 1))) return -1;
+    char parent[PATH_MAX], pres[PATH_MAX];
+    if (slash == path) snprintf(parent, sizeof parent, "/");
+    else if ((size_t)(slash - path) >= sizeof parent) return -1;
+    else snprintf(parent, sizeof parent, "%.*s", (int)(slash - path), path);
+    if (resolved_local(parent, pres, sizeof pres) != 0) return -1;
+    int n = pres[strlen(pres) - 1] == '/' ? snprintf(out, cap, "%s%s", pres, slash + 1)
+                                          : snprintf(out, cap, "%s/%s", pres, slash + 1);
+    if (n < 0 || (size_t)n >= cap) return -1;
+    return 0;
+}
+
 /* ---- the folder ---- */
 
 static void add_entry(Text *t, const char *url_path, const char *name, const struct stat *st, int is_root) {
@@ -344,7 +578,7 @@ static int do_propfind(Conn *c, Request *r) {
     if (body_discard(c, r) != 0) return -1;
     char local[PATH_MAX];
     struct stat st;
-    if (local_path(r->path, local, sizeof local) != 0 || stat(local, &st) != 0) return respond_empty(c, r, 404, "Not Found");
+    if (resolved_local(r->path, local, sizeof local) != 0 || stat(local, &st) != 0) return respond_empty(c, r, 404, "Not Found");
     Text t = {0};
     adds(&t, "<?xml version=\"1.0\" encoding=\"utf-8\"?><D:multistatus xmlns:D=\"DAV:\">");
     const char *slash = strrchr(r->path, '/');
@@ -359,6 +593,7 @@ static int do_propfind(Conn *c, Request *r) {
             struct stat cs;
             if (snprintf(child, sizeof child, "%s/%s", local, e->d_name) >= (int)sizeof child) continue;
             if (snprintf(url, sizeof url, "%s%s%s", r->path, r->path[strlen(r->path) - 1] == '/' ? "" : "/", e->d_name) >= (int)sizeof url) continue;
+            if (share_denied(url)) continue; /* device-private names are not listed */
             if (lstat(child, &cs) != 0 || !(S_ISREG(cs.st_mode) || S_ISDIR(cs.st_mode))) continue; /* no links out of the folder */
             add_entry(&t, url, e->d_name, &cs, 0);
         }
@@ -385,7 +620,7 @@ static int do_get(Conn *c, Request *r) {
     if (body_discard(c, r) != 0) return -1;
     char local[PATH_MAX];
     struct stat st;
-    if (local_path(r->path, local, sizeof local) != 0) return respond_empty(c, r, 404, "Not Found");
+    if (resolved_local(r->path, local, sizeof local) != 0) return respond_empty(c, r, 404, "Not Found");
     int fd = open(local, O_RDONLY | O_NOFOLLOW);
     if (fd < 0 || fstat(fd, &st) != 0) {
         if (fd >= 0) close(fd);
@@ -448,7 +683,7 @@ static int do_get(Conn *c, Request *r) {
 static int do_put(Conn *c, Request *r) {
     char local[PATH_MAX], temp[PATH_MAX];
     struct stat st;
-    if (local_path(r->path, local, sizeof local) != 0) {
+    if (resolved_local(r->path, local, sizeof local) != 0) {
         body_discard(c, r);
         return respond_empty(c, r, 403, "Forbidden");
     }
@@ -514,7 +749,7 @@ static int remove_path(const char *local) {
 static int do_delete(Conn *c, Request *r) {
     if (body_discard(c, r) != 0) return -1;
     char local[PATH_MAX];
-    if (strcmp(r->path, "/") == 0 || local_path(r->path, local, sizeof local) != 0) return respond_empty(c, r, 403, "Forbidden");
+    if (strcmp(r->path, "/") == 0 || resolved_local_linkfinal(r->path, local, sizeof local) != 0) return respond_empty(c, r, 403, "Forbidden");
     if (remove_path(local) != 0) return errno == ENOENT ? respond_empty(c, r, 404, "Not Found") : respond_empty(c, r, 403, "Forbidden");
     return respond_empty(c, r, 204, "No Content");
 }
@@ -522,7 +757,7 @@ static int do_delete(Conn *c, Request *r) {
 static int do_mkcol(Conn *c, Request *r) {
     if (body_discard(c, r) != 0) return -1;
     char local[PATH_MAX];
-    if (local_path(r->path, local, sizeof local) != 0) return respond_empty(c, r, 403, "Forbidden");
+    if (resolved_local_create(r->path, local, sizeof local) != 0) return respond_empty(c, r, 403, "Forbidden");
     if (mkdir(local, 0755) == 0) return respond_empty(c, r, 201, "Created");
     if (errno == EEXIST) return respond_empty(c, r, 405, "Method Not Allowed");
     if (errno == ENOENT) return respond_empty(c, r, 409, "Conflict");
@@ -533,10 +768,13 @@ static int do_move_copy(Conn *c, Request *r, int move) {
     if (body_discard(c, r) != 0) return -1;
     char from[PATH_MAX], to[PATH_MAX];
     struct stat st;
-    if (!r->destination[0] || strcmp(r->path, "/") == 0 || local_path(r->path, from, sizeof from) != 0 ||
-        local_path(r->destination, to, sizeof to) != 0)
+    if (!r->destination[0] || strcmp(r->path, "/") == 0 ||
+        (move ? resolved_local_linkfinal(r->path, from, sizeof from) : resolved_local(r->path, from, sizeof from)) != 0 ||
+        (move ? resolved_local_linkfinal(r->destination, to, sizeof to) : resolved_local(r->destination, to, sizeof to)) != 0)
         return respond_empty(c, r, 400, "Bad Request");
-    if (stat(from, &st) != 0) return respond_empty(c, r, 404, "Not Found");
+    /* MOVE's source may be a dangling link (the link itself is what moves), so its
+       existence is an lstat question; COPY reads through its source, so stat. */
+    if ((move ? lstat(from, &st) : stat(from, &st)) != 0) return respond_empty(c, r, 404, "Not Found");
     int existed = stat(to, &st) == 0;
     if (existed && !r->overwrite) return respond_empty(c, r, 412, "Precondition Failed");
     if (existed && strcmp(from, to) != 0 && remove_path(to) != 0) return respond_empty(c, r, 403, "Forbidden");
@@ -558,7 +796,9 @@ static int do_lock(Conn *c, Request *r) {
     int status = 200;
     char local[PATH_MAX];
     struct stat st;
-    if (local_path(r->path, local, sizeof local) != 0) return respond_empty(c, r, 403, "Forbidden");
+    /* Resolve (create-strict: a dangling final or intermediate link refuses) before
+       making the empty file: a refused LOCK must not create through a link. */
+    if (resolved_local_create(r->path, local, sizeof local) != 0) return respond_empty(c, r, 403, "Forbidden");
     if (stat(local, &st) != 0) { /* locking a name that isn't there makes an empty file */
         int fd = open(local, O_CREAT | O_WRONLY, 0644);
         if (fd < 0) return respond_empty(c, r, 409, "Conflict");
@@ -806,6 +1046,10 @@ static int read_request(Conn *c, Request *r) {
 
 static int handle(Conn *c, Request *r) {
     if (!strncmp(r->path, "/.henge/", 8)) return serve_henge(c, r);
+    if (share_denied(r->path) || (r->destination[0] && share_denied(r->destination))) {
+        if (body_discard(c, r) != 0) return -1;
+        return respond_empty(c, r, 404, "Not Found");
+    }
     const char *m = r->method;
     if (!strcmp(m, "OPTIONS")) {
         if (body_discard(c, r) != 0) return -1;

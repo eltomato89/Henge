@@ -147,7 +147,18 @@ final class Machines: ObservableObject {
 
     private func collect() async {
         guard importing == nil, let items = try? FileManager.default.contentsOfDirectory(at: Self.inbox, includingPropertiesForKeys: nil) else { return }
+        let evaluation = Sharing.guardEvaluation()
+        if evaluation.state == .blanket {
+            HengeLog.log("machines", "automatic imports are paused: the picked folder cannot be opened and no last-known folder is on record")
+        }
         for folder in items where Self.hasDisk(folder) && Self.required.allSatisfy({ FileManager.default.fileExists(atPath: folder.appendingPathComponent($0).path) }) {
+            // A folder in, or equal to, a folder served to a Mac is not
+            // brought in on its own: it stays where it is, and can still
+            // be brought in by picking it.
+            guard !evaluation.refuses(folder) else {
+                HengeLog.log("machines", "not importing \(folder.lastPathComponent): it is inside the folder served to the Mac")
+                continue
+            }
             await adopt(folder, move: true)
         }
     }
