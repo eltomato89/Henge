@@ -274,10 +274,10 @@ final class HardwareMouse {
         let configured = defaults.object(forKey: Self.scrollSpeedKey) == nil
             ? 0.3 : defaults.double(forKey: Self.scrollSpeedKey)
         let scale = Float(configured.isFinite ? min(max(configured, 0.1), 1.5) : 0.3)
-        let way: Float = reverse ? -1 : 1
+        // GameController's values are the content's way; fingers on the Mac's pad move the other way.
+        let way: Float = reverse ? 1 : -1
         // Sensor units per GameController unit: about 40 at the default speed (0.3).
         let gain = way * ScrollFingers.unitsPerPoint * scale / 0.3
-        // A finger moving up the pad (sensor y falling) scrolls as a wheel turned away from you did before.
         scrollFingers.move(dx: horizontalChanged ? second * gain : 0, dy: verticalChanged ? first * gain : 0)
     }
 }
@@ -285,6 +285,12 @@ final class HardwareMouse {
 /// Two fingers on the Mac's emulated Magic Trackpad 2, driven by a hardware trackpad's scroll. Finger ids 14 and 15
 /// stay clear of the touchscreen's 1...5. The two calls GameController makes per sample are merged into one frame,
 /// so the guest sees evenly spaced samples and works out the fingers' speed (and the momentum after) correctly.
+///
+/// The emulated pad is only so big, and a long swipe runs off it. Lifting the fingers there at speed would start
+/// macOS's momentum, and putting them down again at once reads as a second flick during it, which macOS answers by
+/// scrolling faster and faster. So the fingers start at the edge they move away from, and at the far edge they
+/// first hold still for a moment (the motion meanwhile is kept), lift with no speed left, start again from the
+/// other edge, and the kept motion is paid out over the next samples.
 final class ScrollFingers {
     static let unitsPerPoint: Float = 40
     private static let ids: (Int32, Int32) = (14, 15)
@@ -294,12 +300,17 @@ final class ScrollFingers {
     /// No sample for this long: the fingers lifted without the closing (0, 0).
     private static let idleLift: TimeInterval = 0.12
     private static let mergeDelay: TimeInterval = 0.003
+    /// How long the fingers rest at an edge before lifting, so macOS sees them stopped.
+    private static let rest: TimeInterval = 0.05
 
     private var down = false
     private var x: Float = 0, y: Float = 0
     private var pendingX: Float = 0, pendingY: Float = 0
     private var flushScheduled = false
     private var idle: DispatchWorkItem?
+    /// Resting at an edge until this time; motion meanwhile goes to the backlog.
+    private var restingUntil: CFTimeInterval?
+    private var backlogX: Float = 0, backlogY: Float = 0
 
     private static func now() -> UInt32 { UInt32(truncatingIfNeeded: Int(CACurrentMediaTime() * 1000)) }
 
@@ -320,37 +331,78 @@ final class ScrollFingers {
     func end() {
         idle?.cancel()
         idle = nil
+        // Whatever was held back at an edge is dropped: replaying it now would be a jump.
+        restingUntil = nil
+        backlogX = 0
+        backlogY = 0
         flush()
         lift()
     }
 
     private func flush() {
         flushScheduled = false
-        let dx = pendingX, dy = pendingY
+        var dx = pendingX, dy = pendingY
         pendingX = 0
         pendingY = 0
+        guard dx != 0 || dy != 0 || restingUntil != nil else { return }
+        let ts = Self.now()
+
+        if let until = restingUntil {
+            backlogX += dx
+            backlogY += dy
+            if CACurrentMediaTime() < until {
+                frame(ts) // still: the guest's idea of the fingers' speed falls to nothing
+                return
+            }
+            restingUntil = nil
+            lift()
+            place(towardX: backlogX, towardY: backlogY)
+            dx = 0
+            dy = 0
+        }
+        // Pay out what was held back, a share each sample, on top of the new motion.
+        if backlogX != 0 || backlogY != 0 {
+            let shareX = backlogX * 0.35, shareY = backlogY * 0.35
+            dx += shareX
+            dy += shareY
+            backlogX -= shareX
+            backlogY -= shareY
+            if abs(backlogX) < 1 && abs(backlogY) < 1 { backlogX = 0; backlogY = 0 }
+        }
         guard dx != 0 || dy != 0 else { return }
-        if !down { place() }
-        var nx = x + dx, ny = y + dy
-        // At the sensor's edge, start again from the middle, as a hand would.
+        if !down { place(towardX: dx, towardY: dy) }
+        let nx = x + dx, ny = y + dy
         if nx - Self.spread / 2 < Self.margin || nx + Self.spread / 2 > Self.sensorW - Self.margin
             || ny < Self.margin || ny > Self.sensorH - Self.margin {
-            lift()
-            place()
-            nx = x + dx
-            ny = y + dy
+            // The edge: rest here, keeping this sample's motion for after.
+            restingUntil = CACurrentMediaTime() + Self.rest
+            backlogX += dx
+            backlogY += dy
+            frame(ts)
+            return
         }
         x = nx
         y = ny
-        let ts = Self.now()
+        frame(ts)
+    }
+
+    private func frame(_ ts: UInt32) {
         henge_vm_touch(Self.ids.0, 1, Int32(x - Self.spread / 2), Int32(y), ts)
         henge_vm_touch(Self.ids.1, 1, Int32(x + Self.spread / 2), Int32(y), ts)
         henge_vm_touch_frame(ts)
     }
 
-    private func place() {
-        x = Self.sensorW / 2
-        y = Self.sensorH / 2
+    /// Fingers down at the edge the motion leads away from, so a swipe has the whole pad to travel.
+    private func place(towardX: Float, towardY: Float) {
+        let lowX = Self.margin + Self.spread / 2, highX = Self.sensorW - Self.margin - Self.spread / 2
+        let lowY = Self.margin, highY = Self.sensorH - Self.margin
+        if abs(towardY) >= abs(towardX) {
+            y = towardY > 0 ? lowY : highY
+            x = Self.sensorW / 2
+        } else {
+            x = towardX > 0 ? lowX : highX
+            y = Self.sensorH / 2
+        }
         let ts = Self.now()
         henge_vm_touch(Self.ids.0, 0, Int32(x - Self.spread / 2), Int32(y), ts)
         henge_vm_touch(Self.ids.1, 0, Int32(x + Self.spread / 2), Int32(y), ts)
