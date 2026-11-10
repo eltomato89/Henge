@@ -163,7 +163,6 @@ struct SessionView: View {
         }
         .statusBarHidden(zoomed || Device.isPad)
         .persistentSystemOverlays(.hidden)
-        .preferredColorScheme(.dark)
         .sheet(isPresented: $showDetails) { details }
         .confirmationDialog("Shut down \(mac.name)?", isPresented: $confirmStop, titleVisibility: .visible) {
             Button("Shut Down", role: .destructive) { finish() }
@@ -553,7 +552,6 @@ struct SessionView: View {
             .navigationTitle("Details")
             .navigationBarTitleDisplayMode(.inline)
         }
-        .preferredColorScheme(.dark)
     }
 
     // MARK: Running

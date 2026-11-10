@@ -22,6 +22,7 @@ struct SettingsView: View {
     @AppStorage(JITBootstrap.codeCacheKey) private var codeCacheMB = JITBootstrap.defaultCodeCacheMB
     @State private var pickingShareFolder = false
     @State private var servedRoot = Sharing.servedDescription
+    @AppStorage(DeskAppearance.key) private var appearance = DeskAppearance.system
 
     /// The second footer paragraph: how you click, given the selected input mode.
     private var inputDescription: String {
@@ -164,6 +165,15 @@ struct SettingsView: View {
                             .font(.footnote).foregroundStyle(.secondary)
                     }
                     Text("The Mac mounts this folder and can read and change everything in it. Henge's own working files (its log, the JIT pairing file, its tuning files) are never served, even if the folder you pick contains them. A pick is kept until you change it; if the folder goes away, Henge falls back to the Shared folder.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
+                .listRowBackground(Desk.card)
+                Section("Appearance") {
+                    Picker("Appearance", selection: $appearance) {
+                        ForEach(DeskAppearance.allCases) { Text($0.title).tag($0) }
+                    }
+                    .pickerStyle(.segmented)
+                    Text("System follows the \(Device.name)'s Light or Dark setting. Henge stays dark while a Mac is running.")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
                 .listRowBackground(Desk.card)
