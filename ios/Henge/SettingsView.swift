@@ -2,6 +2,8 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 struct SettingsView: View {
+    private enum Page: Hashable { case keyboard }
+
     @ObservedObject private var jit = JITCoordinator.shared
     @AppStorage(JITCoordinator.autoEnableKey) private var jitAtLaunch = false
     @AppStorage(HardwareMouse.speedKey) private var mouseSpeed = 1.0
@@ -62,6 +64,10 @@ struct SettingsView: View {
                          ? "A Mac's memory is kept out of this limit once JIT is on. If iOS refuses that, it uses free storage instead."
                          : "This install isn't signed with the increased memory limit entitlement. Reinstall Henge with a certificate that has it. Export your Mac first if the reinstall replaces the app's data.")
                         .font(.footnote).foregroundStyle(.secondary)
+                }
+                .listRowBackground(Desk.card)
+                Section {
+                    NavigationLink("Keyboard", value: Page.keyboard)
                 }
                 .listRowBackground(Desk.card)
                 if Device.isPad {
@@ -167,6 +173,35 @@ struct SettingsView: View {
                 servedRoot = Sharing.servedDescription
             }
             .onAppear { servedRoot = Sharing.servedDescription }
+            .navigationDestination(for: Page.self) { page in
+                switch page {
+                case .keyboard: KeyboardSettingsView()
+                }
+            }
         }
+    }
+}
+
+private struct KeyboardSettingsView: View {
+    @AppStorage(HardwareShortcutMapper.Shortcut.appSwitcher.defaultsKey) private var appSwitcher = false
+    @AppStorage(HardwareShortcutMapper.Shortcut.quit.defaultsKey) private var quit = false
+    @AppStorage(HardwareShortcutMapper.Shortcut.spotlight.defaultsKey) private var spotlight = false
+
+    var body: some View {
+        Form {
+            Section {
+                Toggle("Control-Tab to switch apps", isOn: $appSwitcher)
+                Toggle("Control-Q to quit the current app", isOn: $quit)
+                Toggle("Control-Space for Spotlight", isOn: $spotlight)
+            } header: {
+                Text("Mac Shortcuts")
+            } footer: {
+                Text("Use Control in place of Command on a physical keyboard. Hold Control and press Tab again to cycle through apps. Add Shift to cycle backwards. iOS may use Control-Space to switch keyboards.")
+            }
+            .listRowBackground(Desk.card)
+        }
+        .scrollContentBackground(.hidden)
+        .background(Desk.page)
+        .navigationTitle("Keyboard")
     }
 }

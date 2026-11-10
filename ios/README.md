@@ -56,9 +56,13 @@ the packager as an environment variable (`HENGE_ENTITLEMENTS=... ios/scripts/pac
   the clipboard. The Mac's clipboard follows along; going the other way uses the
   system paste button, since iOS asks permission when an app reads it on its own.
 - **Hardware input** (`Henge/Hardware.swift`): a keyboard's keys go to the Mac's
-  USB keyboard by HID usage, which is how iOS reports them. A trackpad or mouse
-  goes through GameController with the pointer locked, which iPadOS allows only
-  for an app filling the screen. The first scroll values are logged to
+  USB keyboard by HID usage, which is how iOS reports them. Settings → Keyboard
+  can map Control-Tab, Control-Q and Control-Space to their Command equivalents
+  separately. Hold Control to keep the app switcher open, and add Shift to cycle
+  backwards. iOS may use Control-Space to switch keyboards. Run
+  `make test-hardware-shortcuts` to check shortcut and release handling.
+  A trackpad or mouse goes through GameController with the pointer locked,
+  which iPadOS allows only for an app filling the screen. The first scroll values are logged to
   `henge.log`, to tune scrolling from a real device.
 - **Chips**: the virtual CPU offers Armv8.5 instructions (`core/sysreg.c`), which
   macOS uses and which run as they are, so Henge needs an A14 or M1 or newer.
