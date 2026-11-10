@@ -290,6 +290,24 @@ final class Machines: ObservableObject {
         save()
     }
 
+    /// Makes a Mac's disk larger. The image is sparse, so this costs no storage until macOS writes there; the engine
+    /// takes the file's size as the disk's size at the next start (host/disk.c), and macOS then needs
+    /// `diskutil apfs resizeContainer` to use the room. Never shrinks: that would cut off what macOS stored.
+    @discardableResult
+    func growDisk(_ mac: VirtualMac, to bytes: Int64) throws -> VirtualMac {
+        let current = (try? FileManager.default.attributesOfItem(atPath: mac.disk.path)[.size] as? Int64) ?? mac.diskBytes
+        guard bytes > current else { throw message("The disk can only be made larger.") }
+        let h = try FileHandle(forWritingTo: mac.disk)
+        defer { try? h.close() }
+        try h.truncate(atOffset: UInt64(bytes))
+        try h.synchronize()
+        var grown = mac
+        grown.diskBytes = bytes
+        update(grown)
+        HengeLog.log("machines", "\(mac.name): disk grown from \(current >> 30) GB to \(bytes >> 30) GB")
+        return grown
+    }
+
     func delete(_ id: UUID) {
         try? FileManager.default.removeItem(at: Self.directory(for: id))
         all.removeAll { $0.id == id }

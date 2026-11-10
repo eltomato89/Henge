@@ -162,6 +162,7 @@ final class HardwareMouse {
     private var reverse = false
     private var scrollsLogged = 0 // the first few, to see what a device's raw values look like
     private var lastScrollFirst: Float = 0, lastScrollSecond: Float = 0
+    private let scrollFingers = ScrollFingers()
 
     func start() {
         let defaults = UserDefaults.standard
@@ -195,6 +196,7 @@ final class HardwareMouse {
     func stop() {
         PointerLock.set(false)
         releaseButtons()
+        scrollFingers.end()
         observers.forEach(NotificationCenter.default.removeObserver)
         observers.removeAll()
         for mouse in mice {
@@ -244,38 +246,122 @@ final class HardwareMouse {
         if !pressed { StickyKeys.shared.releaseAll() }
     }
 
-    /// GameController puts vertical motion on the first axis and horizontal on the second.
-    /// macOS accelerates wheel units roughly quadratically, so use a tunable square root
-    /// and cap each event to keep a small pad gesture from jumping across a page.
+    /// GameController puts vertical motion on the first axis and horizontal on the second, as the fingers' travel
+    /// since the last sample (about every 8 ms on a Magic Keyboard), and ends a gesture with both at 0.
+    ///
+    /// The Mac doesn't get these as wheel clicks: a wheel steps in lines that macOS accelerates, so a small swipe ran
+    /// to the end of a page in jumps. They become two fingers moving on the Magic Trackpad 2 the Mac already has
+    /// (the touchscreen's, Trackpad.swift), so macOS scrolls them as a trackpad: smoothly, with its own momentum
+    /// when the fingers lift.
     private func scrolled(_ first: Float, _ second: Float) {
         // GameController reports both axis states when either one changes. On a
         // Magic Keyboard it calls us twice per movement, with one stale axis in
-        // each call; sending both values doubles the scroll and adds sideways drift.
+        // each call; taking both values each time would double the motion.
         let verticalChanged = first != lastScrollFirst
         let horizontalChanged = second != lastScrollSecond
         lastScrollFirst = first
         lastScrollSecond = second
-        let mostlyVertical = abs(first) > 2 * abs(second)
-        let mostlyHorizontal = abs(second) > 2 * abs(first)
-        let verticalRaw = verticalChanged && !mostlyHorizontal ? -first : 0
-        let horizontalRaw = horizontalChanged && !mostlyVertical ? second : 0
+        if scrollsLogged < 24 {
+            scrollsLogged += 1
+            HengeLog.log("input", "scroll raw: \(first), \(second)")
+        }
+        guard first.isFinite, second.isFinite else { return }
+        if first == 0 && second == 0 {
+            scrollFingers.end()
+            return
+        }
         let defaults = UserDefaults.standard
         let configured = defaults.object(forKey: Self.scrollSpeedKey) == nil
             ? 0.3 : defaults.double(forKey: Self.scrollSpeedKey)
         let scale = Float(configured.isFinite ? min(max(configured, 0.1), 1.5) : 0.3)
-        let way: Int32 = reverse ? -1 : 1
-        let horizontal = way * Self.wheelUnits(horizontalRaw, scale: scale)
-        let vertical = way * Self.wheelUnits(verticalRaw, scale: scale)
-        if scrollsLogged < 24 {
-            scrollsLogged += 1
-            HengeLog.log("input", "scroll raw: \(first), \(second); units: \(horizontal), \(vertical)")
+        let way: Float = reverse ? -1 : 1
+        // Sensor units per GameController unit: about 40 at the default speed (0.3).
+        let gain = way * ScrollFingers.unitsPerPoint * scale / 0.3
+        // A finger moving up the pad (sensor y falling) scrolls as a wheel turned away from you did before.
+        scrollFingers.move(dx: horizontalChanged ? second * gain : 0, dy: verticalChanged ? first * gain : 0)
+    }
+}
+
+/// Two fingers on the Mac's emulated Magic Trackpad 2, driven by a hardware trackpad's scroll. Finger ids 14 and 15
+/// stay clear of the touchscreen's 1...5. The two calls GameController makes per sample are merged into one frame,
+/// so the guest sees evenly spaced samples and works out the fingers' speed (and the momentum after) correctly.
+final class ScrollFingers {
+    static let unitsPerPoint: Float = 40
+    private static let ids: (Int32, Int32) = (14, 15)
+    private static let sensorW: Float = 8134, sensorH: Float = 5206
+    private static let margin: Float = 300
+    private static let spread: Float = 1100 // the fingers' distance apart, about two centimetres
+    /// No sample for this long: the fingers lifted without the closing (0, 0).
+    private static let idleLift: TimeInterval = 0.12
+    private static let mergeDelay: TimeInterval = 0.003
+
+    private var down = false
+    private var x: Float = 0, y: Float = 0
+    private var pendingX: Float = 0, pendingY: Float = 0
+    private var flushScheduled = false
+    private var idle: DispatchWorkItem?
+
+    private static func now() -> UInt32 { UInt32(truncatingIfNeeded: Int(CACurrentMediaTime() * 1000)) }
+
+    func move(dx: Float, dy: Float) {
+        pendingX += dx
+        pendingY += dy
+        if !flushScheduled {
+            flushScheduled = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + Self.mergeDelay) { [weak self] in self?.flush() }
         }
-        if horizontal != 0 || vertical != 0 { henge_vm_mouse_scroll(horizontal, vertical) }
+        idle?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.end() }
+        idle = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.idleLift, execute: work)
     }
 
-    private static func wheelUnits(_ value: Float, scale: Float) -> Int32 {
-        guard value.isFinite else { return 0 }
-        let units = Int32(min(32, (22 * scale * abs(value).squareRoot()).rounded()))
-        return value < 0 ? -units : units
+    /// The gesture is over: lift both fingers, and macOS carries the scroll on as it would on a Mac.
+    func end() {
+        idle?.cancel()
+        idle = nil
+        flush()
+        lift()
+    }
+
+    private func flush() {
+        flushScheduled = false
+        let dx = pendingX, dy = pendingY
+        pendingX = 0
+        pendingY = 0
+        guard dx != 0 || dy != 0 else { return }
+        if !down { place() }
+        var nx = x + dx, ny = y + dy
+        // At the sensor's edge, start again from the middle, as a hand would.
+        if nx - Self.spread / 2 < Self.margin || nx + Self.spread / 2 > Self.sensorW - Self.margin
+            || ny < Self.margin || ny > Self.sensorH - Self.margin {
+            lift()
+            place()
+            nx = x + dx
+            ny = y + dy
+        }
+        x = nx
+        y = ny
+        let ts = Self.now()
+        henge_vm_touch(Self.ids.0, 1, Int32(x - Self.spread / 2), Int32(y), ts)
+        henge_vm_touch(Self.ids.1, 1, Int32(x + Self.spread / 2), Int32(y), ts)
+        henge_vm_touch_frame(ts)
+    }
+
+    private func place() {
+        x = Self.sensorW / 2
+        y = Self.sensorH / 2
+        let ts = Self.now()
+        henge_vm_touch(Self.ids.0, 0, Int32(x - Self.spread / 2), Int32(y), ts)
+        henge_vm_touch(Self.ids.1, 0, Int32(x + Self.spread / 2), Int32(y), ts)
+        down = true
+    }
+
+    private func lift() {
+        guard down else { return }
+        let ts = Self.now()
+        henge_vm_touch(Self.ids.0, 2, 0, 0, ts)
+        henge_vm_touch(Self.ids.1, 2, 0, 0, ts)
+        down = false
     }
 }

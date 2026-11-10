@@ -6,6 +6,7 @@ struct SettingsView: View {
 
     @ObservedObject private var jit = JITCoordinator.shared
     @AppStorage(JITCoordinator.autoEnableKey) private var jitAtLaunch = false
+    @AppStorage(KeepAlive.key) private var keepAlive = true
     @AppStorage(HardwareMouse.speedKey) private var mouseSpeed = 1.0
     @AppStorage(HardwareMouse.reverseKey) private var reverseScrolling = false
     @AppStorage(HardwareMouse.scrollSpeedKey) private var scrollSpeed = 0.3
@@ -120,6 +121,12 @@ struct SettingsView: View {
                             }
                         }
                     Text("The Mac gets this device's microphone as a sound input. It is recorded only while an app on the Mac is listening. Without headphones the Mac can hear its own sound. Applies the next time a Mac starts.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
+                .listRowBackground(Desk.card)
+                Section("Background") {
+                    Toggle("Keep the Mac running in the background", isOn: $keepAlive)
+                    Text("While a Mac runs, Henge plays silence so iOS doesn't pause it when you switch apps. Uses more battery. iOS can still end Henge when memory runs short: less Mac memory and fewer open apps help. Applies the next time a Mac starts.")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
                 .listRowBackground(Desk.card)

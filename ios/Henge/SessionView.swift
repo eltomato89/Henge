@@ -194,6 +194,7 @@ struct SessionView: View {
             UIApplication.shared.isIdleTimerDisabled = true
             HardwareMouse.shared.start()
             VolumeClicks.shared.start()
+            KeepAlive.shared.start()
         }
         .onDisappear {
             UIApplication.shared.isIdleTimerDisabled = false
@@ -202,6 +203,7 @@ struct SessionView: View {
             HardwareKeys.releaseAll()
             HardwareMouse.shared.stop()
             VolumeClicks.shared.stop()
+            KeepAlive.shared.stop()
         }
         .modifier(ExternalMacDisplayModifier(presentation: MacPresentation(display: display, aspect: mac.aspect)))
         .task(id: bootAttempt) { await run() }
