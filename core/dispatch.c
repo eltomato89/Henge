@@ -859,6 +859,7 @@ static void stop_the_world(HvCpu *cpu) {
         __atomic_store_n(&m->stw_active, 1, __ATOMIC_SEQ_CST);
         __atomic_store_n(&m->flush_pending, 0, __ATOMIC_SEQ_CST);
         pthread_mutex_unlock(&m->stw_mu);
+        uint64_t stw_t0 = mach_absolute_time();
         hv_machine_kick_all(m);
         if (cpu->pc_state) __atomic_store_n(&cpu->pc_state->phase, HV_PHASE_FLUSH, __ATOMIC_RELAXED);
         for (uint32_t spins = 0;; spins++) {
@@ -871,8 +872,19 @@ static void stop_the_world(HvCpu *cpu) {
         }
         if (m->gen_checks) for (int i = 0; i < m->ncpus; i++) if (m->cpus[i] && m->cpus[i] != cpu && m->cpus[i]->pc_state->active) fprintf(stderr, "hengevm: flush while cpu %d is active\n", i);
         pthread_mutex_lock(&m->tr_mu);
+        uint32_t held = (uint32_t)m->nblocks;
+        size_t used = m->jit.used;
         hv_flush_blocks(m);
         pthread_mutex_unlock(&m->tr_mu);
+        { /* When, for matching against stalls on screen (pvg-mon in devices/pvg_metal.m prints the same clock). */
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            struct tm tm;
+            localtime_r(&ts.tv_sec, &tm);
+            fprintf(stderr, "hengevm: code cache dropped at %02d:%02d:%02d.%03ld: %u blocks, %zu MB; the CPUs were stopped for %.1f ms\n",
+                    tm.tm_hour, tm.tm_min, tm.tm_sec, ts.tv_nsec / 1000000, held, used * 4 >> 20,
+                    (double)(mach_absolute_time() - stw_t0) / 24e3);
+        }
         if (cpu->pc_state) __atomic_store_n(&cpu->pc_state->phase, HV_PHASE_RUN, __ATOMIC_RELAXED);
         pthread_mutex_lock(&m->stw_mu);
         __atomic_store_n(&m->stw_active, 0, __ATOMIC_SEQ_CST);

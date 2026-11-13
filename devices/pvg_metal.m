@@ -251,6 +251,88 @@ static double now_seconds(void) {
     return (double)clock_gettime_nsec_np(CLOCK_MONOTONIC) * 1e-9;
 }
 
+/* Frame pacing, for finding what makes the screen stutter: every 10 s one "pvg-mon" line with how far apart the
+   presented frames were, how long the longest batch of GPU commands and the longest pipeline build took (both run
+   on the replay queue, so a long one holds frames back), and the wall clock, to match against the CPU side's
+   "code cache dropped at" lines. A gap of a second or more is taken as the screen not changing, not as a stall. */
+static struct {
+    os_unfair_lock lock;
+    double last_present, last_line;
+    uint32_t gap[6];      /* <20, <33, <50, <100, <250 ms, <1 s */
+    uint32_t idle_gaps;
+    double worst_gap, worst_gap_at;
+    uint32_t execs, slow_execs; /* slow: over 16 ms */
+    double worst_exec, exec_total;
+    uint32_t pipes;
+    double worst_pipe, pipe_total;
+} mon = {.lock = OS_UNFAIR_LOCK_INIT};
+
+static void mon_clock(double ago, char out[16]) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    double t = (double)ts.tv_sec + ts.tv_nsec * 1e-9 - ago;
+    time_t sec = (time_t)t;
+    struct tm tm;
+    localtime_r(&sec, &tm);
+    snprintf(out, 16, "%02d:%02d:%02d.%03d", tm.tm_hour, tm.tm_min, tm.tm_sec, (int)((t - (double)sec) * 1000));
+}
+
+/* Called with the lock held. */
+static void mon_line(double now) {
+    if (!mon.last_line) mon.last_line = now;
+    if (now - mon.last_line < 10) return;
+    uint32_t frames = mon.idle_gaps;
+    for (int i = 0; i < 6; i++) frames += mon.gap[i];
+    if (frames || mon.execs) {
+        char at[16], worst_at[16];
+        mon_clock(0, at);
+        mon_clock(now - mon.worst_gap_at, worst_at);
+        fprintf(stderr, "hengevm: pvg-mon %s: %u frames; gaps <20ms %u, <33 %u, <50 %u, <100 %u, <250 %u, <1s %u, pauses %u; worst gap %.0f ms at %s; "
+                        "batches %u, %.0f ms in all, over 16 ms %u, worst %.0f ms; pipelines built %u, %.0f ms in all, worst %.0f ms\n",
+                at, frames, mon.gap[0], mon.gap[1], mon.gap[2], mon.gap[3], mon.gap[4], mon.gap[5], mon.idle_gaps,
+                mon.worst_gap * 1e3, mon.worst_gap ? worst_at : "-", mon.execs, mon.exec_total * 1e3, mon.slow_execs, mon.worst_exec * 1e3,
+                mon.pipes, mon.pipe_total * 1e3, mon.worst_pipe * 1e3);
+    }
+    memset(mon.gap, 0, sizeof mon.gap);
+    mon.idle_gaps = mon.execs = mon.slow_execs = mon.pipes = 0;
+    mon.worst_gap = mon.worst_exec = mon.exec_total = mon.worst_pipe = mon.pipe_total = 0;
+    mon.last_line = now;
+}
+
+static void mon_present(void) {
+    double now = now_seconds();
+    os_unfair_lock_lock(&mon.lock);
+    if (mon.last_present) {
+        double d = now - mon.last_present;
+        if (d >= 1) mon.idle_gaps++;
+        else {
+            mon.gap[d < 0.020 ? 0 : d < 0.033 ? 1 : d < 0.050 ? 2 : d < 0.100 ? 3 : d < 0.250 ? 4 : 5]++;
+            if (d > mon.worst_gap) mon.worst_gap = d, mon.worst_gap_at = now;
+        }
+    }
+    mon.last_present = now;
+    mon_line(now);
+    os_unfair_lock_unlock(&mon.lock);
+}
+
+static void mon_exec(double took) {
+    os_unfair_lock_lock(&mon.lock);
+    mon.execs++;
+    mon.exec_total += took;
+    if (took > 0.016) mon.slow_execs++;
+    if (took > mon.worst_exec) mon.worst_exec = took;
+    mon_line(now_seconds());
+    os_unfair_lock_unlock(&mon.lock);
+}
+
+static void mon_pipeline(double took) {
+    os_unfair_lock_lock(&mon.lock);
+    mon.pipes++;
+    mon.pipe_total += took;
+    if (took > mon.worst_pipe) mon.worst_pipe = took;
+    os_unfair_lock_unlock(&mon.lock);
+}
+
 /* How the half-float display surface is shown. WindowServer writes DISPLAY-ENCODED values there (extended sRGB: the guest's gray 128 is
    0.502, measured with the colour probe), so mode 0 passes them through. Mode 1 treats them as LINEAR light and applies the sRGB encode,
    which is what this code did before (and was only right for a linear display profile such as ACES CG Linear: with every other profile
@@ -527,8 +609,10 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
             return nil;
         }
         NSError *err = nil;
+        double pipe_t0 = now_seconds();
         id state = tag == 0xe ? [device newRenderPipelineStateWithDescriptor:descriptor error:&err]
                               : [device newRenderPipelineStateWithTileDescriptor:descriptor options:MTLPipelineOptionNone reflection:nil error:&err];
+        mon_pipeline(now_seconds() - pipe_t0);
         if (!state) [self complain:[NSString stringWithFormat:@"pipeline %u: %@", tag, err.localizedDescription]];
         if (tag == 0xe && getenv("HV_SHADER_DUMP") && atoi(getenv("HV_SHADER_DUMP"))) { /* m4 fork: blend state as this iOS read it */
             MTLRenderPipelineDescriptor *rp = descriptor;
@@ -560,7 +644,9 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
             return nil;
         }
         NSError *err = nil;
+        double pipe_t0 = now_seconds();
         id state = [device newComputePipelineStateWithDescriptor:descriptor options:MTLPipelineOptionNone reflection:nil error:&err];
+        mon_pipeline(now_seconds() - pipe_t0);
         if (!state) [self complain:[NSString stringWithFormat:@"compute pipeline: %@", err.localizedDescription]];
         else objc_setAssociatedObject(state, "hvname", [NSString stringWithFormat:@"compute %@", [[descriptor computeFunction] name]], OBJC_ASSOCIATION_RETAIN);
         return state;
@@ -2208,6 +2294,7 @@ typedef struct {
     [self commit:cb channel:ch stamp:stamp complete:YES];
     double t2 = now_seconds();
     encode_time += t1 - t_begin, gpu_wait_time += t2 - t1;
+    mon_exec(t2 - t_begin);
     if (++execs % 2000 == 0) {
         static double t0;
         if (!t0) t0 = now_seconds();
@@ -2576,6 +2663,7 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
             [cb presentDrawable:drawable];
             [cb commit];
             gpu_frames++;
+            mon_present();
         } else {
             screen_dirty = YES;
         }
