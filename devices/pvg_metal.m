@@ -493,10 +493,18 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
 - (void)resetFailureState { failure = nil; }
 - (BOOL)hadLookupFailure { return failure != nil; }
 - (NSString *)firstFailureReason { return failure; }
+/* As Apple's host does: ref 0 is no function (not a failure), and only an object-list entry of type 6 is one. Any other
+   object handed to Metal as a function is read as one by the GPU driver. A compute pipeline still gets the stand-in, as
+   Metal's deserializer aborts on a nil compute function. */
 - (id)functionWithFunctionRef:(unsigned long long)ref {
+    if (!ref) {
+        if (standIn && !failure) failure = @"function ref 0 in a compute pipeline";
+        return standIn;
+    }
     HvObject *o = [replay object:(uint32_t)ref task:task];
-    if (!o || !o->object) {
-        if (!failure) failure = [NSString stringWithFormat:@"function %llu", ref];
+    if (!o || !o->object || (o->entry[0] & 0xff) != OBJ_FUNCTION) {
+        if (!failure) failure = o && o->object ? [NSString stringWithFormat:@"function %llu is an object of type %u", ref, o->entry[0] & 0xff]
+                                               : [NSString stringWithFormat:@"function %llu", ref];
         return standIn;
     }
     return o->object;
@@ -532,6 +540,10 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
     }
     struct __attribute__((packed)) { uint64_t off; uint32_t len; uint32_t tag, size; } h;
     if (hv_pvg_lite_task_read(lite, task, at, &h, sizeof h)) return nil;
+    if (h.tag != 0xf) { /* Apple's host takes only this record as a function */
+        [self complain:[NSString stringWithFormat:@"function record tag %u, not 15", h.tag]];
+        return nil;
+    }
     NSMutableData *lib = [NSMutableData dataWithLength:h.len];
     if (hv_pvg_lite_task_read(lite, task, h.off, lib.mutableBytes, h.len)) return nil;
     /* iOS 17 refuses macOS's libraries as they are (a macOS 15 build, AIR 2.7): relabelled as iOS 17 ones
@@ -589,7 +601,37 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
             [lib writeToFile:[dir stringByAppendingPathComponent:name] atomically:NO];
         }
     }
+    if (library.functionNames.count != 1) { /* Apple's host: "Unexpected function count in library" */
+        [self complain:[NSString stringWithFormat:@"library with %lu functions", (unsigned long)library.functionNames.count]];
+        return nil;
+    }
     return [library newFunctionWithName:library.functionNames.firstObject];
+}
+
+/* A pipeline's descriptor from the guest's serialized form, as Apple's host makes it: a failed function lookup or a
+   missing vertex, tile or compute function and there is no pipeline. */
+- (id)pipelineDescriptor:(uint32_t)tag data:(NSData *)all task:(uint32_t)task {
+    const uint32_t *w = all.bytes;
+    id<HvMetalSPI> spi = (id)device;
+    HvContext *ctx = [HvContext new];
+    ctx->replay = self, ctx->task = task;
+    if (tag == 0xb) ctx->standIn = [self computeStandIn];
+    dispatch_data_t data = dispatch_data_create((const uint8_t *)all.bytes + 16, w[3], NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+    id descriptor = tag == 0xe ? [spi newRenderPipelineDescriptorWithSerializedData:data deserializationContext:ctx]
+                  : tag == 0x33 ? [spi newTileRenderPipelineDescriptorWithSerializedData:data deserializationContext:ctx]
+                                : [spi newComputePipelineDescriptorWithSerializedData:data deserializationContext:ctx];
+    if (!descriptor || ctx->failure) {
+        [self complain:[NSString stringWithFormat:@"%@ descriptor %u: %@", tag == 0xb ? @"compute" : @"pipeline", tag, ctx->failure]];
+        return nil;
+    }
+    id function = tag == 0xe ? [(MTLRenderPipelineDescriptor *)descriptor vertexFunction]
+                : tag == 0x33 ? [(MTLTileRenderPipelineDescriptor *)descriptor tileFunction]
+                              : [(MTLComputePipelineDescriptor *)descriptor computeFunction];
+    if (!function) {
+        [self complain:[NSString stringWithFormat:@"pipeline %u without its %s function", tag, tag == 0xe ? "vertex" : tag == 0x33 ? "tile" : "compute"]];
+        return nil;
+    }
+    return descriptor;
 }
 
 - (id)makeSerialized:(uint64_t)at length:(uint32_t)size task:(uint32_t)task {
@@ -597,17 +639,13 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
     if (hv_pvg_lite_task_read(lite, task, at, all.mutableBytes, size)) return nil;
     const uint32_t *w = all.bytes;
     uint32_t tag = w[0];
+    if ((tag == 0xe || tag == 0x33 || tag == 0xb) && (size < 16 || w[3] > size - 16)) { /* Apple's host checks this too */
+        [self complain:[NSString stringWithFormat:@"pipeline %u: %u bytes of data in a %u-byte record", tag, size >= 16 ? w[3] : 0, size]];
+        return nil;
+    }
     if (tag == 0xe || tag == 0x33) { /* render or tile pipeline: {tag, size, ref, length, data} */
-        id<HvMetalSPI> spi = (id)device;
-        HvContext *ctx = [HvContext new];
-        ctx->replay = self, ctx->task = task;
-        dispatch_data_t data = dispatch_data_create((const uint8_t *)all.bytes + 16, w[3], NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
-        id descriptor = tag == 0xe ? [spi newRenderPipelineDescriptorWithSerializedData:data deserializationContext:ctx]
-                                   : [spi newTileRenderPipelineDescriptorWithSerializedData:data deserializationContext:ctx];
-        if (!descriptor || ctx->failure) {
-            [self complain:[NSString stringWithFormat:@"pipeline descriptor %u: %@", tag, ctx->failure]];
-            return nil;
-        }
+        id descriptor = [self pipelineDescriptor:tag data:all task:task];
+        if (!descriptor) return nil;
         NSError *err = nil;
         double pipe_t0 = now_seconds();
         id state = tag == 0xe ? [device newRenderPipelineStateWithDescriptor:descriptor error:&err]
@@ -633,16 +671,8 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
         return state;
     }
     if (tag == 0xb) { /* compute pipeline: {tag, size, ref, length, data} */
-        id<HvMetalSPI> spi = (id)device;
-        HvContext *ctx = [HvContext new];
-        ctx->replay = self, ctx->task = task;
-        dispatch_data_t data = dispatch_data_create((const uint8_t *)all.bytes + 16, w[3], NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
-        ctx->standIn = [self computeStandIn];
-        id descriptor = [spi newComputePipelineDescriptorWithSerializedData:data deserializationContext:ctx];
-        if (!descriptor || ctx->failure) {
-            [self complain:[NSString stringWithFormat:@"compute descriptor: %@", ctx->failure]];
-            return nil;
-        }
+        id descriptor = [self pipelineDescriptor:tag data:all task:task];
+        if (!descriptor) return nil;
         NSError *err = nil;
         double pipe_t0 = now_seconds();
         id state = [device newComputePipelineStateWithDescriptor:descriptor options:MTLPipelineOptionNone reflection:nil error:&err];
@@ -2878,7 +2908,11 @@ void hv_pvg_metal_submit(HvPvgMetal *m, HvPvgLite *lite, uint32_t ch, uint32_t *
                     /* "May be thrown away": Apple's host only marks it purgeable, and the bytes stay
                        until the system needs the memory. Here they just stay. */
                 } else if (op == 0x20 && n >= 4) {
-                    [r->tasks removeObjectForKey:@(args[0] >> 1)];
+                    /* Delete task: the id as every other command names it. Only define task (0x38) sends it shifted left with a
+                       flag in bit 0 (Apple's host: -[PGFIFO CmdDeleteTask] passes p[0] to deleteTaskID: as it is). Shifted here,
+                       an ended process kept its objects and the next one given its id got its functions wherever an object-list
+                       entry read the same: a vertex function in a fragment slot, and the GPU driver died (issue 102). */
+                    [r->tasks removeObjectForKey:@(args[0])];
                 } else {
                     hv_pvg_lite_command(lite, cmd, len);
                     if (op == 8 && n >= 16) {
