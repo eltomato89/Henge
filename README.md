@@ -21,6 +21,59 @@
   <a href="LICENSE"><img src="https://img.shields.io/github/license/Leviidev/Henge?style=flat-square&color=2E6BFF&labelColor=111111" alt="GPL-2.0-or-later"></a>
 </p>
 
+> [!NOTE]
+> **This is a personal fork of [Leviidev/Henge](https://github.com/Leviidev/Henge).** The `local` branch is the upstream `main` plus the changes below, tested on an iPad with a Magic Keyboard. Fixes that are useful upstream go back as pull requests. For the official app, releases and support, use the [original repository](https://github.com/Leviidev/Henge).
+
+## What this fork adds
+
+### Choosable disk size
+The Mac's disk is no longer fixed at 64 GB. In a Mac's settings, **Storage → Disk size** grows `disk.img` in 16 GB steps up to 2 TB. It shows a warning when the device's free space is short. The image is sparse, so it takes only the space macOS actually writes. A disk can grow but never shrink.
+
+After growing it, macOS still has to take the new space. Its APFS container can only grow into free space directly behind it, and the recovery container sits there. In Terminal on the Mac:
+
+```bash
+diskutil list                                   # find the Apple_APFS_Recovery container (disk0s3)
+sudo diskutil apfs deleteContainer disk0s3      # remove it (or: eraseVolume free none disk0s3)
+sudo diskutil repairDisk disk0                  # move the GPT's backup header to the new end of the disk
+sudo diskutil apfs resizeContainer disk0s2 0    # grow the main container into all free space
+```
+
+### Smooth trackpad scrolling on iPad
+Two-finger scrolling on a Magic Keyboard trackpad or a mouse wheel used to arrive as coarse wheel clicks, so a small swipe could jump far down a page. Now Henge plays it on the Mac's virtual Magic Trackpad 2 as two fingers moving, so macOS scrolls the way a real Mac trackpad does: pixel-smooth, with its own momentum and rubber-banding.
+- The fingers start at the far edge of the virtual pad. When they reach the other side, they rest briefly before re-gripping, so macOS doesn't start momentum or speed up partway through a long swipe.
+- **Settings → Mouse and Trackpad → Reverse scrolling** and **Scroll speed** still apply.
+
+### The iPad's battery in macOS
+The Mac sees the iPad's battery as a USB UPS (a HID power device on a third xHCI port). macOS shows its charge, whether it's charging, and whether it's on power in the menu bar and in System Settings → Battery. It can use its normal UPS settings to shut down when the iPad runs low.
+
+### Keeps running in the background
+iOS only keeps an app with the audio background mode running while it actually plays sound, and a quiet Mac plays none. So while a Mac runs, Henge plays silence (inaudible, and mixed with other apps). This keeps the Mac running when you switch to another app. Turn it off in **Settings → Background**. iOS can still end Henge when memory runs short.
+
+### Built-in JIT with other Apple devices nearby
+Built-in StikJIT looked up the device's RemotePairing port over Bonjour and took the first answer. That answer could come from another Apple device on the same Wi-Fi, such as an iPhone, and JIT then failed with *"Henge couldn't reach this device"* even though LocalDevVPN was connected. Henge now uses only a port that is actually open on this device. Sent upstream as [#166](https://github.com/Leviidev/Henge/pull/166).
+
+### Merged pull requests from upstream
+These open pull requests on Leviidev/Henge are merged here:
+- [#91](https://github.com/Leviidev/Henge/pull/91): **Microphone**. The Mac gets the device's microphone as a sound input (opt-in, Settings → Sound).
+- [#88](https://github.com/Leviidev/Henge/pull/88): **Pick the shared folder**. Serve any folder to the Mac instead of only the built-in one. Henge's own working files are never served.
+- [#72](https://github.com/Leviidev/Henge/pull/72): **Mac shortcuts**. Optional Control-Tab, Control-Q and Control-Space for the app switcher, Quit and Spotlight (Settings → Keyboard).
+
+### Building this fork
+First run the dependency and engine steps under [Building](#building) below (`fetch_deps.sh`, `build_ios_restore.sh`, `make ios-lib`). Then, to sign with your own paid developer team and install directly:
+
+```bash
+cd ios && xcodegen
+xcodebuild -project Henge.xcodeproj -scheme Henge -configuration Release \
+  -destination 'id=<device UDID>' -derivedDataPath build/DD -allowProvisioningUpdates \
+  DEVELOPMENT_TEAM=<TEAM ID> HENGE_BUNDLE_IDENTIFIER=com.<you>.henge \
+  HENGE_ENTITLEMENTS=$PWD/build/Henge.dev.entitlements build
+xcrun devicectl device install app --device <device UDID> build/DD/Build/Products/Release-iphoneos/Henge.app
+```
+
+`Henge.dev.entitlements` holds `get-task-allow`, `com.apple.developer.kernel.increased-memory-limit` and `com.apple.developer.kernel.extended-virtual-addressing`. Built-in JIT needs LocalDevVPN and a pairing file from Henge's JIT setup.
+
+---
+
 Download macOS, install it on the device, and use it.
 
 - **Own emulator** — iOS gives apps no hypervisor, so Henge runs the Mac's arm64 code through its own JIT, with its own MMU and devices. It doesn't use QEMU or Virtualization.framework.
