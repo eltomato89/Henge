@@ -110,6 +110,16 @@ struct InstallView: View {
                     .padding(.horizontal, 17)
                     .padding(.bottom, 10)
             }
+            // This stepper only sizes the Mac about to be installed. Someone with a Mac already took it for that Mac's
+            // memory, which stayed as it was: point them to where it is set.
+            if !Machines.shared.all.isEmpty {
+                Text("For the Mac this installs. To change a Mac you already have, tap it in Macs and set its memory there.")
+                    .font(.system(size: 13))
+                    .foregroundStyle(Desk.dim)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 17)
+                    .padding(.bottom, 10)
+            }
             Rectangle().fill(Desk.hairline).frame(height: 0.5)
             Toggle("Delete the download after", isOn: $deleteAfter)
                 .font(.system(size: 16))

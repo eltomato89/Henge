@@ -16,7 +16,7 @@ import UIKit
 ///   move X Y, click X Y  the pointer to a spot on the Mac's screen (its pixels), and a click there
 ///   pointer            where the pointer is now, into the log
 ///   knob NAME VALUE    a translation knob (core/machine.h)
-///   cpus N             the CPUs setting (1-6) for the next Mac started; it stays, so set it back afterwards
+///   cpus N             the CPUs setting (1 to the device's core count) for the next Mac started; it stays, so set it back afterwards
 ///   env NAME [VALUE]   set (or unset) an engine environment setting for the next Mac started
 ///   balloon MB         ask the Mac for that much of its memory back (HV_BALLOON set), log what it gave
 ///   snap [NAME]        the Mac's screen (1920x1080) into Documents/NAME.jpg (snap.jpg)
@@ -126,11 +126,11 @@ enum Autopilot {
                 HengeLog.log("autopilot", "snap: no screen to read")
             }
         case "cpus": // "cpus 2": the CPU count the next Mac started gets (the CPUs setting, kept: put it back after a test)
-            if let n = Int(arg), (1...6).contains(n) {
+            if let n = Int(arg), (1...Device.maxCPUs).contains(n) {
                 UserDefaults.standard.set(n, forKey: "henge.cpus")
                 HengeLog.log("autopilot", "cpus \(n) for the next start")
             } else {
-                HengeLog.log("autopilot", "cpus wants 1 to 6")
+                HengeLog.log("autopilot", "cpus wants 1 to \(Device.maxCPUs)")
             }
         case "env": // "env HV_QOS ui": an engine setting read when the next Mac starts (one not in henge-env.txt, which wins)
             let kv = arg.split(separator: " ", maxSplits: 1).map(String.init)

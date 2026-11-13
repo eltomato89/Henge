@@ -42,6 +42,22 @@ enum Device {
         return mb >= 14_000 ? 8 : mb >= 10_000 ? 6 : mb >= 7_000 ? 4 : mb >= 5_000 ? 3 : 2
     }
 
+    /// The most CPUs a Mac can be given here: one per core this device has, up to the engine's HV_MAX_CPUS (8,
+    /// core/machine.h). More virtual CPUs than cores would only take turns on them.
+    static var maxCPUs: Int { min(max(ProcessInfo.processInfo.activeProcessorCount, 1), 8) }
+
+    /// This device's cores by kind ("2 performance and 4 efficiency cores"), from the hw.perflevel sysctls; nil where
+    /// the system doesn't say.
+    static var coreDescription: String? {
+        func count(_ name: String) -> Int? {
+            var n: Int32 = 0, size = MemoryLayout<Int32>.size
+            return sysctlbyname(name, &n, &size, nil, 0) == 0 ? Int(n) : nil
+        }
+        guard let fast = count("hw.perflevel0.physicalcpu") else { return nil }
+        guard let slow = count("hw.perflevel1.physicalcpu"), slow > 0 else { return "\(fast) cores" }
+        return "\(fast) performance and \(slow) efficiency cores"
+    }
+
     /// The choices for a Mac's memory, in GB.
     static let memoryChoices = 1...16
 

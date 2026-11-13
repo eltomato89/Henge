@@ -42,12 +42,16 @@ struct MacSettingsView: View {
                 .deskCard()
 
                 DeskHeading("Processors")
-                Stepper(value: $cpus, in: 1...6) {
-                    HStack {
-                        Text("CPUs").font(.system(size: 16))
-                        Spacer()
-                        Text("\(cpus)").font(.system(size: 16, weight: .semibold))
+                VStack(alignment: .leading, spacing: 8) {
+                    Stepper(value: $cpus, in: 1...Device.maxCPUs) {
+                        HStack {
+                            Text("CPUs").font(.system(size: 16))
+                            Spacer()
+                            Text("\(cpus)").font(.system(size: 16, weight: .semibold))
+                        }
                     }
+                    Text("Up to one per core: this \(Device.name) has \(Device.coreDescription ?? "\(Device.maxCPUs) cores"). Applies the next time a Mac starts, and to every Mac.")
+                        .font(.system(size: 13)).foregroundStyle(Desk.dim)
                 }
                 .padding(.horizontal, 17)
                 .padding(.vertical, 10)
