@@ -867,6 +867,73 @@ static void wait_while_off(HvCpu *cpu) {
     hv_big_lock(m);
 }
 
+/* HV_FLUSH_CENSUS=1 (measuring): what the code cache held when it filled, to see why it fills. Counted with
+   every CPU stopped, just before the blocks go; takes a moment for millions of blocks. */
+typedef struct { uint64_t k1, k2; } CensusKey; /* k1: pa << 8 | instructions - 1; k2: va | flags << 60 */
+static int census_cmp(const void *a, const void *b) {
+    const CensusKey *x = a, *y = b;
+    return x->k1 < y->k1 ? -1 : x->k1 > y->k1 ? 1 : x->k2 < y->k2 ? -1 : x->k2 > y->k2;
+}
+static void census(HvMachine *m) {
+    static int on = -1;
+    if (on < 0) on = getenv("HV_FLUSH_CENSUS") != NULL;
+    uint32_t n = (uint32_t)m->nblocks;
+    if (!on || n < 1000) return;
+    uint64_t t0 = mach_absolute_time();
+    CensusKey *k = malloc((size_t)n * sizeof *k);
+    if (!k) return;
+    uint64_t stale = 0, insns = 0, by_flags[16] = {0}, where[3] = {0}; /* where: kernel, the shared region, other user */
+    uint64_t where_stale[3] = {0};
+    for (uint32_t i = 0; i < n; i++) {
+        const HvBlock *b = &m->blocks[i];
+        k[i].k1 = b->pa << 8 | ((b->ninsns ? b->ninsns : 1) - 1);
+        k[i].k2 = (b->va & 0x0fffffffffffffffull) | (uint64_t)(b->flags & 15) << 60;
+        int w = (b->va >> 55) & 1 ? 0 : b->va >= 0x180000000ull && b->va < 0x300000000ull ? 1 : 2;
+        where[w]++;
+        if (hv_code_gen(b->ram, b->pa) != b->gen) stale++, where_stale[w]++;
+        insns += b->ninsns;
+        by_flags[b->flags & 15]++;
+    }
+    qsort(k, n, sizeof *k, census_cmp);
+    /* Sorted by where the code is: how much distinct code there is under the blocks, and what the rest are. */
+    uint64_t starts = 0, same_key = 0, other_flags = 0, other_va = 0, covered = 0, cover_end = 0, pages = 0;
+    struct { uint64_t page, n, va; } top[8] = {{0}}, cur = {~0ull, 0, 0};
+    for (uint32_t i = 0; i < n; i++) {
+        uint64_t pa = k[i].k1 >> 8, len = ((k[i].k1 & 0xff) + 1) * 4;
+        if (!i || pa != k[i - 1].k1 >> 8) starts++;
+        else if (k[i].k2 == k[i - 1].k2) same_key++;                                  /* an older generation of the same block */
+        else if ((k[i].k2 << 4) == (k[i - 1].k2 << 4)) other_flags++;                 /* the same code for another CPU state */
+        else other_va++;                                                              /* the same code at another address */
+        if (pa >= cover_end) covered += len, cover_end = pa + len;
+        else if (pa + len > cover_end) covered += pa + len - cover_end, cover_end = pa + len;
+        uint64_t page = pa >> HV_TLB_PAGE_BITS;
+        if (page != cur.page) {
+            if (cur.n) {
+                int lo = 0;
+                for (int j = 1; j < 8; j++) if (top[j].n < top[lo].n) lo = j;
+                if (cur.n > top[lo].n) top[lo] = cur;
+            }
+            cur.page = page, cur.n = 0, cur.va = k[i].k2 & 0x0fffffffffffffffull;
+            pages++;
+        }
+        cur.n++;
+    }
+    free(k);
+    fprintf(stderr, "hengevm: census: %u blocks, %llu instructions in them (%.1f a block), %zu MB of translations (%.0f bytes a block)\n",
+            n, (unsigned long long)insns, (double)insns / n, m->jit.used * 4 >> 20, (double)m->jit.used * 4 / n);
+    fprintf(stderr, "hengevm: census: distinct code under them: %.1f MB in %llu pages (%.1fx translated over); %llu distinct block starts\n",
+            (double)covered / 1048576, (unsigned long long)pages, (double)insns * 4 / (double)(covered ? covered : 1), (unsigned long long)starts);
+    fprintf(stderr, "hengevm: census: of the blocks: %.1f%% stale; at a start another block has: %.1f%% an older generation of the same, %.1f%% for another CPU state, %.1f%% at another address\n",
+            100.0 * stale / n, 100.0 * same_key / n, 100.0 * other_flags / n, 100.0 * other_va / n);
+    fprintf(stderr, "hengevm: census: kernel %.1f%% (stale %.1f%%), shared region %.1f%% (stale %.1f%%), other user %.1f%% (stale %.1f%%); by state:",
+            100.0 * where[0] / n, 100.0 * where_stale[0] / (where[0] + 1.0), 100.0 * where[1] / n, 100.0 * where_stale[1] / (where[1] + 1.0),
+            100.0 * where[2] / n, 100.0 * where_stale[2] / (where[2] + 1.0));
+    for (int f = 0; f < 16; f++) if (by_flags[f]) fprintf(stderr, " %x: %.1f%%", f, 100.0 * by_flags[f] / n);
+    fprintf(stderr, "\nhengevm: census: pages with the most blocks:");
+    for (int j = 0; j < 8; j++) if (top[j].n) fprintf(stderr, " %llu at va %llx,", (unsigned long long)top[j].n, (unsigned long long)top[j].va & ~0x3fffull);
+    fprintf(stderr, " counted in %.0f ms\n", (double)(mach_absolute_time() - t0) / 24e3);
+}
+
 /* Dropping every translation: the CPU that finds a flush pending waits until
    all the others have parked (at this barrier, asleep or off), flushes, and
    lets them go. Nobody holds a lock while waiting here. */
@@ -892,6 +959,7 @@ static void stop_the_world(HvCpu *cpu) {
         pthread_mutex_lock(&m->tr_mu);
         uint32_t held = (uint32_t)m->nblocks;
         size_t used = m->jit.used;
+        census(m);
         hv_flush_blocks(m);
         pthread_mutex_unlock(&m->tr_mu);
         { /* When, for matching against stalls on screen (pvg-mon in devices/pvg_metal.m prints the same clock). */
