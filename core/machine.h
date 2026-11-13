@@ -33,10 +33,6 @@ typedef struct HvRam {
        JavaScript engine) write new code beside code that is running, and dropping the whole page each time meant
        translating the same blocks over and over (and the code cache filling with the dropped ones). */
     uint64_t *code_map;
-    /* Per page, once code in it has changed in place: a generation for each 256 bytes (NULL: all 0). A block's is that
-       of the 256 bytes it starts in (hv_code_gen), so a write into code drops the blocks that start in the written
-       256 bytes and the 512 before (a block is at most 512 bytes long), not the whole page's (hv_invalidate_chunks). */
-    uint16_t **cgen;
     uint16_t *code_spared; /* per page: such writes let through since its translations were last dropped */
     size_t npages;
 } HvRam;
@@ -55,7 +51,7 @@ typedef struct HvBlock {
     uint64_t va, pa;
     uint32_t flags;      /* HV_BLOCK_* state the translation depends on */
     uint32_t ninsns;
-    uint64_t gen;        /* hv_code_gen of its first instruction when translated */
+    uint32_t gen;        /* page_gen of its page when translated */
     struct HvRam *ram;   /* where its page lives, for a quick staleness check */
     uint64_t pg;
     uint32_t *code;
@@ -80,8 +76,6 @@ typedef struct HvBlock {
 typedef struct HvStats {
     uint64_t blocks, translations, block_flushes;
     uint64_t flush_smc, flush_ic, flush_full;  /* why translations were dropped */
-    uint64_t flush_chunk;     /* writes into code that dropped only the blocks around the written bytes */
-    uint64_t chunk_unchained; /* exits unchained by those */
     uint64_t code_spared;     /* writes to a code page that touched none of its translated code: nothing dropped */
     uint64_t code_respun;     /* translations made again because their code changed as they were made */
     uint64_t chained, ijc_fills, ijc_resets;
@@ -277,10 +271,7 @@ typedef struct HvMachine {
        block (0: a same-page exit), and once chained, the target's physical page
        (| 1) so that invalidating its code can unchain it. Each such page's chained exits are a list from its
        HvRam.xhead through slot_xnext (slot + 1, 0 at the end); a slot is on one at a time, until the page's code changes. */
-    /* slot_xa 1: an exit to the same page, but to another 256 bytes of it than its block starts in: listed and
-       unchained the same way (slot_tchunk: which 256 bytes of the page the target starts in), with no TLB check. */
     uint64_t *slot_xa, *slot_xpa;
-    uint8_t *slot_tchunk;
     uint32_t *slot_xnext, nxchained;
     uint32_t nslots;
     HvCpu *cpu;              /* CPU 0: the one that polls devices */
@@ -318,16 +309,7 @@ static inline uint32_t hv_block_hash(uint64_t va, uint64_t pa, uint32_t flags) {
 }
 
 /* Lock-free: blocks are only added (release store) until a flush, which stops every CPU. */
-/* The generation of the code at pa: its page's, and that of its 256 bytes of the page. A block is current while
-   this is what it was when the block was translated. */
-static inline uint64_t hv_code_gen(const HvRam *r, uint64_t pa) {
-    uint64_t pg = (pa - r->pa) >> HV_TLB_PAGE_BITS;
-    uint64_t g = (uint64_t)__atomic_load_n(&r->page_gen[pg], __ATOMIC_SEQ_CST) << 16;
-    const uint16_t *c = __atomic_load_n(&r->cgen[pg], __ATOMIC_SEQ_CST);
-    return c ? g | __atomic_load_n(&c[(pa >> 8) & 63], __ATOMIC_SEQ_CST) : g;
-}
-
-static inline HvBlock *hv_block_find(HvMachine *m, uint32_t h, uint64_t va, uint64_t pa, uint32_t flags, uint64_t gen) {
+static inline HvBlock *hv_block_find(HvMachine *m, uint32_t h, uint64_t va, uint64_t pa, uint32_t flags, uint32_t gen) {
     for (HvBlock *b = __atomic_load_n(&m->hash[h], __ATOMIC_ACQUIRE); b; b = __atomic_load_n(&b->next, __ATOMIC_ACQUIRE))
         if (b->va == va && b->pa == pa && b->flags == flags && b->gen == gen) return b;
     return NULL;
@@ -367,8 +349,6 @@ static inline uint64_t hv_code_bits(uint64_t off, uint64_t len) {
 }
 /* `len` bytes at pa (in one page) are being written: drops the page's translations if they may hold any of them. */
 void hv_code_written(HvMachine *m, HvRam *r, uint64_t pa, uint64_t len);
-/* The code in bytes [off, off + len) of a page changed: drops the blocks that may hold any of it. */
-void hv_invalidate_chunks(HvMachine *m, HvRam *r, uint64_t pg, uint64_t off, uint64_t len);
 HvMmio *hv_mmio_lookup(HvMachine *m, uint64_t pa);
 /* Host pointer for `len` bytes of guest RAM at pa, or NULL. */
 void *hv_phys_ptr(HvMachine *m, uint64_t pa, uint64_t len);

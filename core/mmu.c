@@ -951,7 +951,7 @@ static int ijc_note_page(const HvBlock *b) {
        drops this target too (its request reaches this CPU after the fill). Else noted here, in the order. */
     while (old != v && old != ~0ull)
         if (__atomic_compare_exchange_n(slot, &old, old ? ~0ull : v, 0, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED)) break;
-    return hv_code_gen(r, b->pa) == b->gen;
+    return __atomic_load_n(&r->page_gen[pg], __ATOMIC_SEQ_CST) == b->gen;
 }
 
 void hv_ijc_drop_code_page(HvCpu *cpu, uint64_t v) {
@@ -1026,7 +1026,7 @@ static void *ijc_resolve(HvCpu *cpu, uint64_t va, uint32_t flags) {
         if ((uint64_t)(host - m->ram[i].host) < m->ram[i].size) ram = &m->ram[i];
     if (!ram) return 0;
     uint64_t pa = ram->pa + (uint64_t)(host - ram->host);
-    uint64_t gen = hv_code_gen(ram, pa);
+    uint32_t gen = __atomic_load_n(&ram->page_gen[(pa - ram->pa) >> HV_TLB_PAGE_BITS], __ATOMIC_ACQUIRE);
     /* This CPU's small cache in front of the block hash first (as the dispatcher's lookup). */
     uint32_t j = (uint32_t)((va >> 2) ^ (va >> 18) ^ ((uint64_t)flags << 13)) & ((1u << HV_JC_BITS) - 1);
     HvBlock *b = pcs->jc[j].va == va ? pcs->jc[j].b : NULL;

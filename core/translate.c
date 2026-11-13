@@ -93,7 +93,6 @@ typedef struct {
     uint32_t flags;
     int slow_mem;
     uint64_t page;       /* guest VA of the 16 KB page the block is in */
-    uint32_t chunk;      /* which 256 bytes of it the block starts in */
     int no_ijc;          /* indirect branches always go to the dispatcher (breakpoints, tests' stop PC) */
     HvMachine *m;
     uint64_t cur_pc;     /* guest PC of the instruction being translated (or whose out-of-line exit is) */
@@ -398,9 +397,6 @@ static void put_branch_exit(Emit *e, uint64_t target, int plain) {
     uint32_t slot_index = ~0u;
     int same_page = (target & ~((1ull << HV_TLB_PAGE_BITS) - 1)) == e->page;
     uint64_t xa = same_page ? 0 : cross_addend(e, target);
-    /* To other code of the page that a write may drop without this block (hv_invalidate_chunks): chained through
-       the dispatcher, which lists it, so it can be unchained then. */
-    int tracked = same_page && ((uint32_t)(target >> 8) & 63) != e->chunk;
     if (same_page || xa) {
         slot_index = __atomic_fetch_add(&e->m->nslots, 1, __ATOMIC_RELAXED); /* translations run in parallel */
         if (slot_index >= e->m->max_slots) slot_index = ~0u; /* out of slots until the next flush: no chaining */
@@ -418,7 +414,7 @@ static void put_branch_exit(Emit *e, uint64_t target, int plain) {
     *slot = 0;
     e->m->slot_site[slot_index] = NULL; /* until placed: what it held is a dropped block's */
     e->m->slot_cond[slot_index] = NULL;
-    e->m->slot_xa[slot_index] = tracked ? 1 : xa;
+    e->m->slot_xa[slot_index] = xa;
     e->m->slot_xpa[slot_index] = 0;
     uint32_t to_exit = ~0u;
     if (check) {
@@ -454,7 +450,7 @@ static void put_branch_exit(Emit *e, uint64_t target, int plain) {
         e->site[e->nsite].stub = e->n;
         e->site[e->nsite].has_cond = 0;
         e->site[e->nsite++].stub_cold = (uint8_t)(e->in_cold && !e->flat);
-        e->site_direct = !check && !xa && !tracked;
+        e->site_direct = !check && !xa;
     }
     if (check) link_here(e, to_exit, p0);
     put(e, STR_X(30, 28, HV_CPU_X(30)));
@@ -1965,7 +1961,6 @@ static int translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32
     e->flags = b->flags;
     e->slow_mem = m->slow_mem || hv_knob[HV_K_PREDSTAT]; /* HV_PREDSTAT (measuring): every access through hv_mem_emulate */
     e->page = b->va & ~((1ull << HV_TLB_PAGE_BITS) - 1);
-    e->chunk = (uint32_t)(b->va >> 8) & 63;
     e->no_ijc = !m->chain;
     e->m = m;
     e->nogroup = nogroup;

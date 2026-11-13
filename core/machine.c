@@ -116,8 +116,7 @@ static int init_rest(HvMachine *m) {
     m->slot_xa = calloc(m->max_slots, sizeof *m->slot_xa);
     m->slot_xpa = calloc(m->max_slots, sizeof *m->slot_xpa);
     m->slot_xnext = calloc(m->max_slots, sizeof *m->slot_xnext);
-    m->slot_tchunk = calloc(m->max_slots, sizeof *m->slot_tchunk);
-    if (!m->slots || !m->slot_site || !m->slot_stub || !m->slot_cond || !m->slot_xa || !m->slot_xpa || !m->slot_xnext || !m->slot_tchunk) return -1;
+    if (!m->slots || !m->slot_site || !m->slot_stub || !m->slot_cond || !m->slot_xa || !m->slot_xpa || !m->slot_xnext) return -1;
     for (int i = 0; i < HV_MAX_CPUS; i++) { /* untouched pages cost nothing, so every CPU gets its tables now */
         HvPerCpu *p = &m->percpu[i];
         p->ijc = calloc(HV_IJC_TABLES * HV_IJC_TABLE_BYTES / 8, 8);
@@ -405,7 +404,6 @@ void hv_machine_free(HvMachine *m) {
     free(m->slot_xa);
     free(m->slot_xpa);
     free(m->slot_xnext);
-    free(m->slot_tchunk);
     if (m->locks_initialized) {
         pthread_mutex_destroy(&m->big_mu);
         pthread_cond_destroy(&m->big_cv);
@@ -436,9 +434,8 @@ int hv_machine_add_ram(HvMachine *m, uint64_t pa, uint64_t size, void *host, int
     r->ijc_va = calloc(pages, sizeof *r->ijc_va);
     r->xhead = calloc(pages, sizeof *r->xhead);
     r->code_map = calloc(pages, sizeof *r->code_map);
-    r->cgen = calloc(pages, sizeof *r->cgen);
     r->code_spared = calloc(pages, sizeof *r->code_spared);
-    return r->code_pages && r->page_gen && r->whint && r->ijc_va && r->xhead && r->code_map && r->cgen && r->code_spared ? 0 : -1;
+    return r->code_pages && r->page_gen && r->whint && r->ijc_va && r->xhead && r->code_map && r->code_spared ? 0 : -1;
 }
 
 int hv_machine_add_mmio(HvMachine *m, uint64_t pa, uint64_t size, void *opaque,
@@ -456,8 +453,6 @@ HvRam *hv_ram_lookup(HvMachine *m, uint64_t pa) {
     }
     return NULL;
 }
-
-static void code_changed(HvMachine *m, HvRam *r, uint64_t pg);
 
 uint32_t *hv_smc_counts;
 uint64_t *hv_smc_last;
@@ -503,11 +498,6 @@ void hv_invalidate_code(HvMachine *m, uint64_t pa) {
     }
     r->xhead[pg] = 0;
     pthread_mutex_unlock(&m->tr_mu);
-    code_changed(m, r, pg);
-}
-
-/* After a page's blocks (all, or those of some of it) went stale: what may still lead into them from outside. */
-static void code_changed(HvMachine *m, HvRam *r, uint64_t pg) {
     /* The indirect-branch cache may lead into the stale blocks: drop those entries (or, without HV_IJC_PAGES, the
        whole cache), here at once and on the other CPUs before they next leave a block (their cache lookups and
        chained exits check exit_req first). Which entries: the page's blocks were cached under one VA page (ijc_va,
@@ -556,84 +546,11 @@ void hv_code_written(HvMachine *m, HvRam *r, uint64_t pa, uint64_t len) {
     uint64_t off = pa - r->pa, pg = off >> HV_TLB_PAGE_BITS;
     if (!__atomic_load_n(&r->code_pages[pg], __ATOMIC_ACQUIRE)) return;
     uint64_t bits = hv_code_bits(off & ((1u << HV_TLB_PAGE_BITS) - 1), len);
-    if (!code_map_on()) {
-        hv_invalidate_code(m, pa);
-        return;
-    }
-    if (__atomic_load_n(&r->code_map[pg], __ATOMIC_SEQ_CST) & bits) {
-        hv_invalidate_chunks(m, r, pg, off & ((1u << HV_TLB_PAGE_BITS) - 1), len);
-        return;
-    }
-    if (++r->code_spared[pg] >= HV_CODE_SPARED_MAX) {
+    if (!code_map_on() || (__atomic_load_n(&r->code_map[pg], __ATOMIC_SEQ_CST) & bits) || ++r->code_spared[pg] >= HV_CODE_SPARED_MAX) {
         hv_invalidate_code(m, pa);
         return;
     }
     m->stats.code_spared++;
-}
-
-/* HV_CODE_CHUNKS=0: a write into code drops its whole page's translations, as before. */
-static int code_chunks_on(void) {
-    static int v = -1;
-    if (v < 0) v = !(getenv("HV_CODE_CHUNKS") && !atoi(getenv("HV_CODE_CHUNKS")));
-    return v;
-}
-
-void hv_invalidate_chunks(HvMachine *m, HvRam *r, uint64_t pg, uint64_t off, uint64_t len) {
-    uint64_t pa = r->pa + (pg << HV_TLB_PAGE_BITS);
-    uint32_t c0 = (uint32_t)(off >> 8), c1 = (uint32_t)((off + (len ? len : 1) - 1) >> 8);
-    if (c1 > 63) c1 = 63;
-    /* A block is at most HV_MAX_BLOCK_INSNS (128) instructions, 512 bytes: one holding a written byte starts in the
-       written 256 bytes or the two before. Exits into another 256 bytes than their block starts in are listed
-       (slot_xa 1), so blocks left current never jump straight into these; the ones dropped reach only each other. */
-    uint32_t lo = c0 >= 2 ? c0 - 2 : 0;
-    if (!code_chunks_on() || !r->code_pages[pg]) {
-        hv_invalidate_code(m, pa);
-        return;
-    }
-    pthread_mutex_lock(&m->tr_mu);
-    uint16_t *g = r->cgen[pg];
-    if (!g) {
-        g = calloc(64, sizeof *g);
-        if (g) __atomic_store_n(&r->cgen[pg], g, __ATOMIC_SEQ_CST);
-    }
-    int wrapped = !g;
-    for (uint32_t c = lo; g && c <= c1; c++)
-        if (g[c] == 0xffff) wrapped = 1;
-    if (wrapped) { /* out of generations (or memory): the page's own moves on, which covers them all */
-        pthread_mutex_unlock(&m->tr_mu);
-        hv_invalidate_code(m, pa);
-        return;
-    }
-    for (uint32_t c = lo; c <= c1; c++) __atomic_add_fetch(&g[c], 1, __ATOMIC_SEQ_CST);
-    /* What was written holds no translated code now (a block marked from here on is new). */
-    __atomic_and_fetch(&r->code_map[pg], ~((~0ull >> (63 - (c1 - c0))) << c0), __ATOMIC_SEQ_CST);
-    m->stats.flush_chunk++;
-    /* Listed exits into the dropped blocks go back to their stubs; the rest of the page's stay. */
-    uint32_t keep = 0, *tail = &keep;
-    for (uint32_t k = r->xhead[pg]; k;) {
-        uint32_t idx = k - 1;
-        k = m->slot_xnext[idx];
-        if (m->slot_tchunk[idx] < lo || m->slot_tchunk[idx] > c1) {
-            *tail = idx + 1;
-            tail = &m->slot_xnext[idx];
-            continue;
-        }
-        m->slot_xnext[idx] = 0;
-        m->slot_xpa[idx] = 0;
-        __atomic_store_n(&m->slots[idx], 0, __ATOMIC_RELEASE);
-        uint32_t *site = m->slot_site[idx];
-        if (site) {
-            uint32_t insn = 0x14000000u | (uint32_t)((m->slot_stub[idx] - site) & 0x3ffffff); /* back to its stub */
-            hv_jit_write(&m->jit, site, &insn, 4);
-            hv_jit_finish(&m->jit, site, 1);
-        }
-        m->nxchained--;
-        m->stats.chunk_unchained++;
-    }
-    *tail = 0;
-    r->xhead[pg] = keep;
-    pthread_mutex_unlock(&m->tr_mu);
-    code_changed(m, r, pg);
 }
 
 void hv_dma_written(HvMachine *m, uint64_t pa, uint64_t len) {
@@ -709,7 +626,7 @@ int hv_phys_write(HvMachine *m, uint64_t pa, const void *buf, unsigned len) {
             if (!r->code_pages[pg]) continue;
             uint64_t lo = pg << HV_TLB_PAGE_BITS, hi = lo + (1u << HV_TLB_PAGE_BITS);
             uint64_t from = off > lo ? off : lo, to = off + len < hi ? off + len : hi;
-            if (__atomic_load_n(&r->code_map[pg], __ATOMIC_SEQ_CST) & hv_code_bits(from - lo, to - from)) hv_invalidate_chunks(m, r, pg, from - lo, to - from);
+            if (__atomic_load_n(&r->code_map[pg], __ATOMIC_SEQ_CST) & hv_code_bits(from - lo, to - from)) hv_invalidate_code(m, r->pa + from);
         }
 #undef CODE_WRITTEN
         return 0;

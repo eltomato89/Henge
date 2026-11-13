@@ -128,11 +128,11 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
     uint32_t j = (uint32_t)((va >> 2) ^ (va >> 18) ^ ((uint64_t)flags << 13)) & ((1u << HV_JC_BITS) - 1);
     __typeof__(cpu->pc_state->jc[0]) *jc = cpu->pc_state->jc;
     HvBlock *c = jc[j].va == va ? jc[j].b : NULL;
-    if (c && c->pa == pa && c->flags == flags && hv_code_gen(c->ram, c->pa) == c->gen) return c;
+    if (c && c->pa == pa && c->flags == flags && c->ram->page_gen[c->pg] == c->gen) return c;
     uint32_t h = hash_of(va, pa, flags);
     HvRam *ram = hv_ram_lookup(m, pa);
     uint64_t pg = (pa - ram->pa) >> HV_TLB_PAGE_BITS;
-    uint64_t gen = hv_code_gen(ram, pa);
+    uint32_t gen = __atomic_load_n(&ram->page_gen[pg], __ATOMIC_ACQUIRE);
     HvBlock *b = find(m, h, va, pa, flags, gen);
     if (b) {
         jc[j].va = va, jc[j].b = b;
@@ -149,7 +149,7 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
         m->stats.code_protects++;
         for (int i = 0; i < m->ncpus; i++) /* in every CPU's TLB, or a write from another CPU goes unnoticed */
             if (m->cpus[i]) hv_tlb_protect_code_page(m->cpus[i], ram, pg);
-        gen = hv_code_gen(ram, pa);
+        gen = __atomic_load_n(&ram->page_gen[pg], __ATOMIC_ACQUIRE);
     }
     /* Translate without the lock, into this thread's buffer... */
     HvBlock nb = {.va = va, .pa = pa, .flags = flags, .gen = gen, .ram = ram, .pg = pg, .maker = cpu->index + 1, .jit_gen = __atomic_load_n(&m->jit_gen, __ATOMIC_SEQ_CST)};
@@ -661,7 +661,7 @@ static void print_stats(HvCpu *cpu, int force) {
                 uint64_t len = 0;
                 for (HvBlock *b = m->hash[h]; b; b = b->next) {
                     len++;
-                    if (hv_code_gen(b->ram, b->pa) != b->gen) stale++;
+                    if (b->ram->page_gen[b->pg] != b->gen) stale++;
                 }
                 if (len) used++;
                 sumsq += len * len;
@@ -672,8 +672,8 @@ static void print_stats(HvCpu *cpu, int force) {
                     m->nblocks ? (double)sumsq / m->nblocks : 0.0);
             int k = 0;
             for (HvBlock *b = m->hash[worst]; b && k < 6; b = b->next, k++)
-                fprintf(stderr, "    worst: va %llx pa %llx flags %x gen %llx/%llx\n", (unsigned long long)b->va,
-                        (unsigned long long)b->pa, b->flags, (unsigned long long)b->gen, (unsigned long long)hv_code_gen(b->ram, b->pa));
+                fprintf(stderr, "    worst: va %llx pa %llx flags %x gen %u/%u\n", (unsigned long long)b->va,
+                        (unsigned long long)b->pa, b->flags, b->gen, b->ram->page_gen[b->pg]);
         }
         {
             double tw = RATE(words_inline) + RATE(words_ool) + RATE(words_pool) + 1e-9;
@@ -702,8 +702,8 @@ static void print_stats(HvCpu *cpu, int force) {
                 RATE(ijc_reset_kind[0]), RATE(ijc_reset_kind[1]), RATE(ijc_reset_kind[2]), RATE(ijc_reset_kind[3]));
         fprintf(stderr, "  code changes/s: no cached target into the page %.0f, that VA page's targets dropped %.0f, all dropped %.0f\n",
                 RATE(code_ijc[0]), RATE(code_ijc[1]), RATE(code_ijc[2]));
-        fprintf(stderr, "  writes to code pages/s: %.0f dropped the page's translations, %.0f only the blocks around the written bytes (%.0f exits unchained), %.0f touched none of its code (nothing dropped); translated again as the code changed meanwhile %.0f\n",
-                RATE(flush_smc), RATE(flush_chunk), RATE(chunk_unchained), RATE(code_spared), RATE(code_respun));
+        fprintf(stderr, "  writes to code pages/s: %.0f dropped the page's translations, %.0f touched none of its code (nothing dropped); translated again as the code changed meanwhile %.0f\n",
+                RATE(flush_smc), RATE(code_spared), RATE(code_respun));
         fprintf(stderr, "  TLBIs left to other CPUs/s: raced %.0f, every address space's cached targets %.0f, big range %.0f, ASID or all %.0f\n",
                 RATE(posted_kind[0]), RATE(posted_kind[3]), RATE(posted_kind[1]), RATE(posted_kind[2]));
         fprintf(stderr, "  remote drop races/s: walking %.0f, filling %.0f, during %.0f; walks of other pages let through %.0f\n", RATE(race_kind[0]), RATE(race_kind[1]), RATE(race_kind[2]),
@@ -795,15 +795,13 @@ static void chain(HvMachine *m, uint64_t *slot, HvBlock *b) {
            check names, and not a stale one (see hv_invalidate_code). */
         uint64_t page_pa = b->pa & ~((1ull << HV_TLB_PAGE_BITS) - 1);
         uint64_t host = (uint64_t)(uintptr_t)(b->ram->host + (page_pa - b->ram->pa));
-        /* xa 1: within the page, to code that may be dropped without the exit's own block (hv_invalidate_chunks). */
-        if (xa != 1 && host - (b->va & ~((1ull << HV_TLB_PAGE_BITS) - 1)) != xa) return;
+        if (host - (b->va & ~((1ull << HV_TLB_PAGE_BITS) - 1)) != xa) return;
         pthread_mutex_lock(&m->tr_mu);
-        if (hv_code_gen(b->ram, b->pa) != b->gen || m->slot_xpa[idx]) {
+        if (__atomic_load_n(&b->ram->page_gen[b->pg], __ATOMIC_ACQUIRE) != b->gen || m->slot_xpa[idx]) {
             pthread_mutex_unlock(&m->tr_mu);
             return;
         }
         m->slot_xpa[idx] = page_pa | 1;
-        m->slot_tchunk[idx] = (uint8_t)((b->pa >> 8) & 63);
         m->slot_xnext[idx] = b->ram->xhead[b->pg]; /* on the target page's list (hv_invalidate_code) */
         b->ram->xhead[b->pg] = idx + 1;
         m->nxchained++;
