@@ -165,6 +165,17 @@ final class HardwareMouse {
     private var scrollsLogged = 0 // the first few, to see what a device's raw values look like
     private var lastScrollFirst: Float = 0, lastScrollSecond: Float = 0
     private let scrollFingers = ScrollFingers()
+    /// Click steadying. Pressing a trackpad rolls the finger a little, and iPadOS reports that as motion just
+    /// before, during and after the press; a Mac's own trackpad drops it. The steps sent lately, to take back at a
+    /// press, and the motion held back while a button is down, until it is clearly a drag.
+    private var recentSteps: [(t: CFTimeInterval, x: Int32, y: Int32)] = []
+    private var heldSteps: [(x: Int32, y: Int32)] = []
+    private var heldX: Int32 = 0, heldY: Int32 = 0
+    private var buttonsDown = 0
+    private var dragging = false
+    private static let undoWindow: CFTimeInterval = 0.06
+    private static let undoLimit: Int32 = 6   // pixels: more than this before a press was meant
+    private static let dragStart: Int32 = 8   // pixels with a button down before it counts as a drag
 
     func start() {
         let defaults = UserDefaults.standard
@@ -215,6 +226,11 @@ final class HardwareMouse {
 
     func releaseButtons() {
         for button in buttons.releaseAll() { henge_vm_mouse_button(button, 0) }
+        buttonsDown = 0
+        dragging = false
+        heldSteps.removeAll()
+        heldX = 0
+        heldY = 0
     }
 
     private func attach(_ mouse: GCMouse) {
@@ -240,7 +256,36 @@ final class HardwareMouse {
         guard x != 0 || y != 0 else { return }
         restX -= x
         restY -= y
-        henge_vm_mouse_move(Int32(x), Int32(y))
+        step(Int32(x), Int32(y))
+    }
+
+    private func step(_ x: Int32, _ y: Int32) {
+        if buttonsDown > 0 && !dragging {
+            heldSteps.append((x, y))
+            heldX += x
+            heldY += y
+            guard max(abs(heldX), abs(heldY)) > Self.dragStart else { return }
+            // A drag after all: the held motion goes now, in the steps it came in.
+            dragging = true
+            for held in heldSteps { henge_vm_mouse_move(held.x, held.y) }
+            heldSteps.removeAll()
+            return
+        }
+        let now = CACurrentMediaTime()
+        recentSteps.append((now, x, y))
+        recentSteps.removeAll { now - $0.t > Self.undoWindow }
+        henge_vm_mouse_move(x, y)
+    }
+
+    /// At a press: take back the last few steps if they add up to only a nudge, the finger rolling as it pressed.
+    /// Sent back step by step, newest first, so macOS's pointer acceleration treats them the same as on the way.
+    private func steadyForPress() {
+        let now = CACurrentMediaTime()
+        let nudge = recentSteps.filter { now - $0.t <= Self.undoWindow }
+        recentSteps.removeAll()
+        let sumX = nudge.reduce(Int32(0)) { $0 + $1.x }, sumY = nudge.reduce(Int32(0)) { $0 + $1.y }
+        guard !nudge.isEmpty, max(abs(sumX), abs(sumY)) <= Self.undoLimit else { return }
+        for back in nudge.reversed() { henge_vm_mouse_move(-back.x, -back.y) }
     }
 
     private func button(_ physicalButton: Int32, _ pressed: Bool) {
@@ -248,6 +293,20 @@ final class HardwareMouse {
         if buttonsLogged < 32 {
             buttonsLogged += 1
             HengeLog.log("input", "physical mouse button: raw=\(physicalButton) guest=\(guestButton) \(pressed ? "down" : "up")")
+        }
+        if pressed {
+            if buttonsDown == 0 {
+                steadyForPress()
+                dragging = false
+                heldSteps.removeAll()
+                heldX = 0
+                heldY = 0
+            }
+            buttonsDown += 1
+        } else {
+            buttonsDown = max(0, buttonsDown - 1)
+            // Released before it became a drag: what was held back was the finger wobbling, not meant.
+            if buttonsDown == 0 { heldSteps.removeAll(); heldX = 0; heldY = 0; dragging = false }
         }
         henge_vm_mouse_button(guestButton, pressed ? 1 : 0)
         if !pressed { StickyKeys.shared.releaseAll() }
