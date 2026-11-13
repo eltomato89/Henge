@@ -157,6 +157,7 @@ final class HardwareMouse {
     private var mice: [GCMouse] = []
     private var buttons = PhysicalMouseButtons(swapsRightAndMiddle: false)
     private var buttonsLogged = 0
+    private var movesLogged = 0
     private var restX: Float = 0, restY: Float = 0
     private var speed: Float = 1
     private var reverse = false
@@ -172,6 +173,7 @@ final class HardwareMouse {
         let swapButtons = defaults.bool(forKey: PhysicalMouseButtons.swapKey)
         buttons = PhysicalMouseButtons(swapsRightAndMiddle: swapButtons)
         buttonsLogged = 0
+        movesLogged = 0
         HengeLog.log("input", "physical mouse: swap right/middle \(swapButtons ? "on" : "off")")
         lastScrollFirst = 0
         lastScrollSecond = 0
@@ -227,6 +229,10 @@ final class HardwareMouse {
 
     /// GameController's Y runs upward. What doesn't make a whole step yet waits for the next move.
     private func moved(_ dx: Float, _ dy: Float) {
+        if movesLogged < 12, dx != 0 || dy != 0 {
+            movesLogged += 1
+            HengeLog.log("input", "mouse moved: \(dx), \(dy) (pointer lock \(UIApplication.shared.connectedScenes.contains { ($0 as? UIWindowScene)?.pointerLockState?.isLocked == true } ? "on" : "off"))")
+        }
         restX += dx * speed
         restY -= dy * speed
         let x = restX.rounded(), y = restY.rounded()
@@ -293,9 +299,16 @@ final class HardwareMouse {
 /// other edge, and the kept motion is paid out over the next samples.
 final class ScrollFingers {
     static let unitsPerPoint: Float = 40
-    private static let ids: (Int32, Int32) = (14, 15)
+    /// Two pairs, used in turn: a pair lifted at an edge isn't put down again under the same ids a moment later.
+    private static let pairs: [(Int32, Int32)] = [(14, 15), (12, 13)]
+    private var pair = 0
+    private var ids: (Int32, Int32) { Self.pairs[pair] }
+    private var eventsLogged = 0
     private static let sensorW: Float = 8134, sensorH: Float = 5206
-    private static let margin: Float = 300
+    /// Where the fingers may go: clear of the pad's edges, and well clear of the bottom, where a real
+    /// Magic Trackpad expects a resting thumb and macOS treats touches differently.
+    private static let minX: Float = sensorW * 0.12, maxX: Float = sensorW * 0.88
+    private static let minY: Float = sensorH * 0.15, maxY: Float = sensorH * 0.70
     private static let spread: Float = 1100 // the fingers' distance apart, about two centimetres
     /// No sample for this long: the fingers lifted without the closing (0, 0).
     private static let idleLift: TimeInterval = 0.12
@@ -372,10 +385,10 @@ final class ScrollFingers {
         guard dx != 0 || dy != 0 else { return }
         if !down { place(towardX: dx, towardY: dy) }
         let nx = x + dx, ny = y + dy
-        if nx - Self.spread / 2 < Self.margin || nx + Self.spread / 2 > Self.sensorW - Self.margin
-            || ny < Self.margin || ny > Self.sensorH - Self.margin {
+        if nx - Self.spread / 2 < Self.minX || nx + Self.spread / 2 > Self.maxX || ny < Self.minY || ny > Self.maxY {
             // The edge: rest here, keeping this sample's motion for after.
             restingUntil = CACurrentMediaTime() + Self.rest
+            log("edge at \(Int(x)),\(Int(y)): resting")
             backlogX += dx
             backlogY += dy
             frame(ts)
@@ -387,15 +400,15 @@ final class ScrollFingers {
     }
 
     private func frame(_ ts: UInt32) {
-        henge_vm_touch(Self.ids.0, 1, Int32(x - Self.spread / 2), Int32(y), ts)
-        henge_vm_touch(Self.ids.1, 1, Int32(x + Self.spread / 2), Int32(y), ts)
+        henge_vm_touch(ids.0, 1, Int32(x - Self.spread / 2), Int32(y), ts)
+        henge_vm_touch(ids.1, 1, Int32(x + Self.spread / 2), Int32(y), ts)
         henge_vm_touch_frame(ts)
     }
 
     /// Fingers down at the edge the motion leads away from, so a swipe has the whole pad to travel.
     private func place(towardX: Float, towardY: Float) {
-        let lowX = Self.margin + Self.spread / 2, highX = Self.sensorW - Self.margin - Self.spread / 2
-        let lowY = Self.margin, highY = Self.sensorH - Self.margin
+        let lowX = Self.minX + Self.spread / 2, highX = Self.maxX - Self.spread / 2
+        let lowY = Self.minY, highY = Self.maxY
         if abs(towardY) >= abs(towardX) {
             y = towardY > 0 ? lowY : highY
             x = Self.sensorW / 2
@@ -404,16 +417,25 @@ final class ScrollFingers {
             y = Self.sensorH / 2
         }
         let ts = Self.now()
-        henge_vm_touch(Self.ids.0, 0, Int32(x - Self.spread / 2), Int32(y), ts)
-        henge_vm_touch(Self.ids.1, 0, Int32(x + Self.spread / 2), Int32(y), ts)
+        log("down \(ids.0)/\(ids.1) at \(Int(x)),\(Int(y))")
+        henge_vm_touch(ids.0, 0, Int32(x - Self.spread / 2), Int32(y), ts)
+        henge_vm_touch(ids.1, 0, Int32(x + Self.spread / 2), Int32(y), ts)
         down = true
     }
 
     private func lift() {
         guard down else { return }
         let ts = Self.now()
-        henge_vm_touch(Self.ids.0, 2, 0, 0, ts)
-        henge_vm_touch(Self.ids.1, 2, 0, 0, ts)
+        henge_vm_touch(ids.0, 2, 0, 0, ts)
+        henge_vm_touch(ids.1, 2, 0, 0, ts)
+        log("up \(ids.0)/\(ids.1) at \(Int(x)),\(Int(y))")
         down = false
+        pair = (pair + 1) % Self.pairs.count
+    }
+
+    private func log(_ text: String) {
+        guard eventsLogged < 40 else { return }
+        eventsLogged += 1
+        HengeLog.log("input", "scroll fingers: \(text)")
     }
 }

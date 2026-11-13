@@ -14,6 +14,9 @@ enum RSDPortResolver {
         var port: UInt16?
         /// What happened, for the log: the port found, or why there is none.
         var detail: String
+        /// Every advertised port, with its host. Other Apple devices on the network advertise the
+        /// service too, so the caller must check which one is open on this device.
+        var candidates: [(port: UInt16, host: String)] = []
     }
 
     private static let serviceType = "_remotepairing._tcp"
@@ -35,6 +38,8 @@ enum RSDPortResolver {
         DNSServiceSetDispatchQueue(browseRef, queue)
 
         let found = state.done.wait(timeout: .now() + timeout) == .success
+        // Give the other devices' answers (and ours, if theirs came first) a moment to arrive.
+        if found { Thread.sleep(forTimeInterval: 1.2) }
         // Tear down on the queue the callbacks run on, so none runs after its ref is gone.
         return queue.sync {
             DNSServiceRefDeallocate(browseRef)
@@ -42,7 +47,8 @@ enum RSDPortResolver {
             state.resolveRefs.removeAll()
             state.finished = true
             if found, let port = state.port {
-                return Result(port: port, detail: "resolved \(serviceType) to port \(port) on \(state.host ?? "?")")
+                let all = state.candidates.map { "\($0.port)@\($0.host)" }.joined(separator: ", ")
+                return Result(port: port, detail: "resolved \(serviceType): \(all)", candidates: state.candidates)
             }
             var detail = "no port within \(Int(timeout))s: \(state.seen) service(s) seen"
             if let error = state.lastError { detail += ", last error \(describe(error))" }
@@ -60,9 +66,12 @@ enum RSDPortResolver {
         var host: String?
         var lastError: DNSServiceErrorType?
         var finished = false
+        var candidates: [(port: UInt16, host: String)] = []
 
         func finish(port: UInt16, host: String) {
-            guard self.port == nil, !finished else { return }
+            guard !finished, !candidates.contains(where: { $0.port == port && $0.host == host }) else { return }
+            candidates.append((port, host))
+            guard self.port == nil else { return }
             self.port = port
             self.host = host
             done.signal()
@@ -72,7 +81,7 @@ enum RSDPortResolver {
     private static let browseCallback: DNSServiceBrowseReply = { _, flags, interface, error, name, type, domain, context in
         guard let context else { return }
         let state = Unmanaged<State>.fromOpaque(context).takeUnretainedValue()
-        guard !state.finished, state.port == nil else { return }
+        guard !state.finished else { return }
         guard error == kDNSServiceErr_NoError else {
             state.lastError = error
             return

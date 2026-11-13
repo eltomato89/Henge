@@ -601,9 +601,11 @@ enum RemotePairingPortDiscovery {
         browser.browseResultsChangedHandler = { results, _ in
             guard !hasFinished() else { return }
 
+            // Only this device's own service (on loopback): other Apple devices on the network advertise
+            // theirs too, and their port is closed here. Without one the helper finds and checks the port.
             let preferred = results.first { result in
                 result.interfaces.contains { $0.name == "lo0" }
-            } ?? results.first
+            }
             guard let result = preferred, case .service = result.endpoint else { return }
 
             resultLock.lock()

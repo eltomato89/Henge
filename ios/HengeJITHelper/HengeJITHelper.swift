@@ -26,8 +26,13 @@ private enum HengeJITWork {
             // Henge found no advertised port. StikJIT's 49152 is closed when the device picked another at boot.
             let lookup = RSDPortResolver.resolve()
             NSLog("[HengeJIT] RemotePairing port: %@", lookup.detail)
-            if let port = lookup.port { configuration.rsdPort = port } else { needsScan = true }
-            portNote = " [helper port lookup: \(lookup.detail); using \(configuration.rsdPort)]"
+            // Every Apple device on the network advertises the service: take only a port open on this device.
+            let open = lookup.candidates.map(\.port).filter {
+                !RSDPortScanner.openPorts(host: configuration.deviceAddress, range: $0...$0, waitMs: 800).isEmpty
+            }
+            if let port = open.first { configuration.rsdPort = port } else { needsScan = true }
+            portNote = " [helper port lookup: \(lookup.detail); open here: \(open.map(String.init).joined(separator: ",")); "
+                + (needsScan ? "scanning]" : "using \(configuration.rsdPort)]")
         }
 
         do {
