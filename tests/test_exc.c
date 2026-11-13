@@ -13,6 +13,7 @@ DECLARE_PROGRAM(p_fptrap);
 DECLARE_PROGRAM(p_psci);
 DECLARE_PROGRAM(p_smc);
 DECLARE_PROGRAM(p_smc_nomaint);
+DECLARE_PROGRAM(p_smc_beside);
 extern const char exc_programs_begin[], exc_programs_finish[];
 
 #define ACK_PA 0x20000000ull
@@ -167,6 +168,23 @@ int main(void) {
         memcpy(code, p->start, len);
         TestProgram copy = {p->name, NULL, code, code + ((const char *)p->end - (const char *)p->start)};
         if (!run(&copy, &c, 0)) check(p->name, "1 then 2 after patching", c.x[1], 3);
+    }
+
+    { /* Writes beside the code drop no translation; the write into it still does. */
+        static const TestProgram beside = TEST_PROGRAM(p_smc_beside);
+        const TestProgram *p = &beside;
+        size_t len = (const char *)p->end - (const char *)p->start + 4;
+        memset(code, 0, 16384);
+        memcpy(code, p->start, len);
+        hv_dma_written(&m, ADDR(code), 16384); /* the page's code is another program's now */
+        TestProgram copy = {p->name, NULL, code, code + ((const char *)p->end - (const char *)p->start)};
+        uint64_t spared0 = m.stats.code_spared, smc0 = m.stats.flush_smc, made0 = m.stats.translations;
+        if (!run(&copy, &c, 0)) {
+            check(p->name, "100 calls of 1, then 2 after patching", c.x[1], 102);
+            check(p->name, "the writes beside the code dropped nothing", m.stats.code_spared - spared0, 100);
+            check(p->name, "the write into the code dropped the page once", m.stats.flush_smc - smc0, 1);
+            check(p->name, "the loop was not translated again for each write", m.stats.translations - made0 < 20, 1);
+        }
     }
 
     printf("%d checks, %d failures\n", checks, failures);

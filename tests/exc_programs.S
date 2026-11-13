@@ -243,5 +243,35 @@ PROGRAM p_smc_nomaint
 5:
 END p_smc_nomaint
 
+// Writes data into its own page, well away from its code (which must stay translated), then patches its
+// subroutine (which must be noticed all the same).
+PROGRAM p_smc_beside
+    mov x1, #0
+    mov x4, #0
+    adr x5, 1f
+    add x5, x5, #2048       // the same 16 KB page, 2 KB past the code
+1:  bl 3f
+    add x1, x1, x0
+    str x4, [x5], #8
+    add x4, x4, #1
+    cmp x4, #100
+    b.lt 1b
+    adr x2, 3f
+    ldr w3, 4f
+    str w3, [x2]
+    dc cvau, x2
+    dsb ish
+    ic ivau, x2
+    dsb ish
+    isb
+    bl 3f
+    add x1, x1, x0
+    b 5f
+3:  mov x0, #1
+    ret
+4:  mov x0, #2
+5:
+END p_smc_beside
+
     .p2align 14
 _exc_programs_finish:

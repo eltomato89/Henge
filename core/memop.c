@@ -415,7 +415,7 @@ static int rmw_target(HvCpu *cpu, uint64_t va, uint32_t bytes, int el, uint64_t 
     if (*host) {
         /* Same rule as other writes: drop translations made from this page. */
         uint64_t pg = (pa - ram->pa) >> HV_TLB_PAGE_BITS;
-        if (ram->code_pages[pg]) hv_invalidate_code(cpu->m, pa);
+        if (ram->code_pages[pg]) hv_invalidate_code(cpu->m, pa); /* the caller writes after this returns: the whole page, as ever */
     }
     *mmio_pa = pa;
     return 0;

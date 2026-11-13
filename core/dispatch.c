@@ -156,6 +156,13 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
     uint64_t t0 = m->stats_interval ? mach_absolute_time() : 0;
     uint8_t phase0 = cpu->pc_state ? cpu->pc_state->phase : 0;
     if (cpu->pc_state) __atomic_store_n(&cpu->pc_state->phase, HV_PHASE_TRANSLATE, __ATOMIC_RELAXED);
+    /* From a copy of the code: once the block has marked where its code lies (below), the copy is compared with the
+       page, so a write that came in between (and saw no mark to drop the page for) is caught here. */
+    uint32_t snap[HV_MAX_BLOCK_INSNS];
+    uint32_t nsnap = avail < HV_MAX_BLOCK_INSNS ? avail : HV_MAX_BLOCK_INSNS;
+    memcpy(snap, code, (size_t)nsnap * 4);
+    const uint32_t *live = code;
+    code = snap, avail = nsnap;
     int failed = hv_translate_emit(m, &nb, code, avail) != 0;
     if (cpu->pc_state) __atomic_store_n(&cpu->pc_state->phase, phase0, __ATOMIC_RELAXED);
     if (failed) goto flush_unlocked;
@@ -169,6 +176,13 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
         pthread_mutex_lock(&m->tr_mu);
         m->stats.flush_full++;
         goto flush;
+    }
+    __atomic_or_fetch(&ram->code_map[pg], hv_code_bits(pa & ((1u << HV_TLB_PAGE_BITS) - 1), (uint64_t)nb.ninsns * 4), __ATOMIC_SEQ_CST);
+    if (memcmp(snap, live, (size_t)nb.ninsns * 4) != 0) {
+        /* Its code changed while it was made: not published (its space stays used until a flush); the caller looks
+           again and translates what is there now. */
+        m->stats.code_respun++;
+        return lookup(cpu, va, pa, flags, live, avail);
     }
     if (m->gen_checks && nb.jit_gen != __atomic_load_n(&m->jit_gen, __ATOMIC_SEQ_CST))
         fprintf(stderr, "hengevm: cpu %u translated across a flush: gen %u to %u, placed at rx+%llx, used %llx, active %d\n", cpu->index, nb.jit_gen, m->jit_gen, (unsigned long long)(nb.code - m->jit.base) * 4, (unsigned long long)m->jit.used * 4, cpu->pc_state->active);
@@ -688,6 +702,8 @@ static void print_stats(HvCpu *cpu, int force) {
                 RATE(ijc_reset_kind[0]), RATE(ijc_reset_kind[1]), RATE(ijc_reset_kind[2]), RATE(ijc_reset_kind[3]));
         fprintf(stderr, "  code changes/s: no cached target into the page %.0f, that VA page's targets dropped %.0f, all dropped %.0f\n",
                 RATE(code_ijc[0]), RATE(code_ijc[1]), RATE(code_ijc[2]));
+        fprintf(stderr, "  writes to code pages/s: %.0f dropped the page's translations, %.0f touched none of its code (nothing dropped); translated again as the code changed meanwhile %.0f\n",
+                RATE(flush_smc), RATE(code_spared), RATE(code_respun));
         fprintf(stderr, "  TLBIs left to other CPUs/s: raced %.0f, every address space's cached targets %.0f, big range %.0f, ASID or all %.0f\n",
                 RATE(posted_kind[0]), RATE(posted_kind[3]), RATE(posted_kind[1]), RATE(posted_kind[2]));
         fprintf(stderr, "  remote drop races/s: walking %.0f, filling %.0f, during %.0f; walks of other pages let through %.0f\n", RATE(race_kind[0]), RATE(race_kind[1]), RATE(race_kind[2]),
