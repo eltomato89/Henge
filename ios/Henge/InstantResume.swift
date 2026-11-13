@@ -9,6 +9,31 @@ enum InstantResume {
     static let key = "henge.instantResume"
     static var enabled: Bool { UserDefaults.standard.bool(forKey: key) }
 
+    /// HV_RESUME_TEST (Documents/henge-env.txt, or the autopilot's env): for measuring one build against another from
+    /// the same saved Mac (tools/ipad_bench.sh). A saved Mac is then picked up whatever build saved it and whatever
+    /// copy of its disk it finds (the engine still refuses one whose saved layouts differ), and the setting doesn't
+    /// have to be on. The test puts disk and saved Mac back from its own copies before each run (Autopilot baseline).
+    static var testMode: Bool { getenv("HV_RESUME_TEST") != nil }
+
+    /// The Mac that is running and what it was started with, for the autopilot's save.
+    static var running: (mac: VirtualMac, ramMB: UInt64, cpus: Int)?
+
+    /// Autopilot: stop the running Mac where it is and write it out. It stays stopped: quit Henge after.
+    static func saveNow() {
+        guard let now = running else { HengeLog.log("resume", "save: no Mac is running"); return }
+        let path = file(for: now.mac).path, id = ident(for: now.mac, ramMB: now.ramMB, cpus: now.cpus)
+        queue.sync {
+            let t0 = Date()
+            var buffer = [CChar](repeating: 0, count: 256)
+            var rc = henge_vm_state() == 4 ? 0 : henge_vm_pause(&buffer, buffer.count)
+            if rc == 0 { rc = henge_vm_save(path, id, &buffer, buffer.count) }
+            let took = String(format: "%.1f", Date().timeIntervalSince(t0))
+            let bytes = (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? Int64) ?? 0
+            HengeLog.log("resume", rc == 0 ? "save: the Mac is saved, in \(took) s (\(ByteText.string(UInt64(max(bytes, 0)))))"
+                                           : "save: not saved after \(took) s: \(String(cString: buffer))")
+        }
+    }
+
     /// Saving and running on take turns on one queue, never on the main thread: a save takes a few seconds.
     private static let queue = DispatchQueue(label: "henge.instant-resume", qos: .userInitiated)
 
@@ -17,6 +42,9 @@ enum InstantResume {
     /// What a saved Mac is for: this build of Henge (a restored machine must meet the code that saved it), the Mac,
     /// and what it was started with. The engine adds the disk's own identity.
     static func ident(for mac: VirtualMac, ramMB: UInt64, cpus: Int) -> String {
+        if testMode {
+            return "Henge test ram \(ramMB) cpus \(cpus) screen \(mac.screen.width)x\(mac.screen.height) retina \(mac.isRetina)"
+        }
         let info = Bundle.main.infoDictionary ?? [:]
         let version = info["CFBundleShortVersionString"] as? String ?? "?"
         let build = info["CFBundleVersion"] as? String ?? "?"

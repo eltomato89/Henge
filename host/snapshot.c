@@ -699,7 +699,9 @@ int hv_snapshot_restore(const char *path, const char *ident, char *err, size_t e
     }
     char disk_now[256];
     h.disk[sizeof h.disk - 1] = 0;
-    if (hv_vm_disk_identity(disk_now, sizeof disk_now) != 0 || strcmp(disk_now, h.disk)) {
+    /* HV_RESUME_TEST (measuring builds against each other from one saved Mac, tools/ipad_bench.sh): the disk is a
+       copy of the one it was saved with, put back before each run by the test itself. */
+    if (!getenv("HV_RESUME_TEST") && (hv_vm_disk_identity(disk_now, sizeof disk_now) != 0 || strcmp(disk_now, h.disk))) {
         close(fd);
         fprintf(stderr, "hengevm: snapshot: the disk changed since the save (%s, now %s)\n", h.disk, disk_now);
         return fail(err, errlen, "The Mac's disk has changed since it was saved.");

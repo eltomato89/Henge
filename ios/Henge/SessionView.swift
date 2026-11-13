@@ -610,7 +610,7 @@ struct SessionView: View {
         }
         HengeLog.log("session", "screen \(mac.screen.width)x\(mac.screen.height) retina \(mac.isRetina)")
         var rc: Int32 = -1
-        if InstantResume.enabled, let at = InstantResume.saved(for: mac, ramMB: ram, cpus: cpus) {
+        if InstantResume.enabled || InstantResume.testMode, let at = InstantResume.saved(for: mac, ramMB: ram, cpus: cpus) {
             HengeLog.log("resume", "picking up the Mac saved \(Int(Date().timeIntervalSince(at))) s ago")
             let t0 = Date()
             rc = henge_vm_resume(mac.rom.path, mac.disk.path, mac.aux.path, mac.ecid, mac.seed, ram, Int32(cpus),
@@ -631,10 +631,13 @@ struct SessionView: View {
             return
         }
         bootRAM = ram
+        InstantResume.running = (mac, ram, cpus)
         started = Date()
-        var used = mac
-        used.lastUsed = started
-        Machines.shared.update(used)
+        if !InstantResume.testMode { // a measuring run doesn't become the Mac Home shows first
+            var used = mac
+            used.lastUsed = started
+            Machines.shared.update(used)
+        }
         var lastBlocks = henge_vm_blocks()
         var lastTime = Date()
         var lastGPUFrames = henge_vm_gpu_frames()

@@ -20,6 +20,10 @@ import UIKit
 ///   env NAME [VALUE]   set (or unset) an engine environment setting for the next Mac started
 ///   balloon MB         ask the Mac for that much of its memory back (HV_BALLOON set), log what it gave
 ///   snap [NAME]        the Mac's screen (1920x1080) into Documents/NAME.jpg (snap.jpg)
+///   testmac            a copy of the Mac used last, called Test, to measure with (an older Test is replaced)
+///   save               stop the running Mac where it is and write it out (instant resume's file); then exit
+///   baseline store NAME, baseline load NAME   keep Test's disk and saved Mac as NAME, or put them back, while no
+///                      Mac runs: with HV_RESUME_TEST set, "mac Test" then picks up exactly there, every time
 ///   log TEXT           a marker in henge.log
 ///   stop               stop the Mac
 ///   exit               quit Henge
@@ -158,6 +162,14 @@ enum Autopilot {
             let text = (try? String(contentsOf: out, encoding: .utf8)) ?? ""
             HengeLog.log("autopilot", "tl: \(app.name) returned \(rc) \(why)")
             for line in text.prefix(4000).split(separator: "\n").prefix(40) { HengeLog.log("tl-out", String(line)) }
+        case "testmac":
+            testMac()
+        case "save":
+            await Task.detached { InstantResume.saveNow() }.value
+        case "baseline":
+            let kv = arg.split(separator: " ").map(String.init)
+            if kv.count == 2, kv[0] == "store" || kv[0] == "load" { baseline(store: kv[0] == "store", name: kv[1]) }
+            else { HengeLog.log("autopilot", "baseline wants store NAME or load NAME") }
         case "log": // already in the log; the wall clock too, to line it up with things measured elsewhere
             HengeLog.log("autopilot", String(format: "at %.3f", Date().timeIntervalSince1970))
         case "stop":
@@ -168,6 +180,67 @@ enum Autopilot {
             exit(0)
         default:
             HengeLog.log("autopilot", "unknown command")
+        }
+    }
+
+    private static let testName = "Test"
+    private static let testFiles = ["AVPBooter.vmapple2.bin", "auxiliary.bin", "disk.img", "machine.json", "resume.hsnap"]
+    private static var baselines: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Baselines", isDirectory: true)
+    }
+
+    /// A Mac to measure with: the files of the Mac used last, copied (on this volume a copy shares its blocks with
+    /// the original until one of them changes, so it takes no room at first).
+    @MainActor private static func testMac() {
+        let fm = FileManager.default
+        guard henge_vm_state() != 1, henge_vm_state() != 4 else { HengeLog.log("autopilot", "testmac: a Mac is running"); return }
+        let all: [VirtualMac] = Machines.shared.all
+        guard let source = all.filter({ $0.name != testName }).max(by: { ($0.lastUsed ?? $0.added) < ($1.lastUsed ?? $1.added) }) else {
+            HengeLog.log("autopilot", "testmac: no Mac to copy")
+            return
+        }
+        for old in all where old.name == testName {
+            try? fm.removeItem(at: old.directory)
+            Machines.shared.forget(old)
+        }
+        var test = source
+        test.id = UUID()
+        test.name = testName
+        test.added = Date(timeIntervalSince1970: 0) // never the one Home shows first
+        test.lastUsed = nil
+        do {
+            try fm.createDirectory(at: test.directory, withIntermediateDirectories: true)
+            for name in testFiles where name != "resume.hsnap" && fm.fileExists(atPath: source.directory.appendingPathComponent(name).path) {
+                try fm.copyItem(at: source.directory.appendingPathComponent(name), to: test.directory.appendingPathComponent(name))
+            }
+            Machines.shared.add(test)
+            HengeLog.log("autopilot", "testmac: \(testName) is a copy of \(source.name)")
+        } catch {
+            try? fm.removeItem(at: test.directory)
+            HengeLog.log("autopilot", "testmac: \(error.localizedDescription)")
+        }
+    }
+
+    @MainActor private static func baseline(store: Bool, name: String) {
+        let fm = FileManager.default
+        guard henge_vm_state() != 1, henge_vm_state() != 4 else { HengeLog.log("autopilot", "baseline: a Mac is running"); return }
+        let all: [VirtualMac] = Machines.shared.all
+        guard let test = all.first(where: { $0.name == testName }) else { HengeLog.log("autopilot", "baseline: no \(testName) Mac (testmac makes one)"); return }
+        let kept = baselines.appendingPathComponent(name, isDirectory: true)
+        let from = store ? test.directory : kept, to = store ? kept : test.directory
+        do {
+            guard fm.fileExists(atPath: from.appendingPathComponent("disk.img").path) else { throw CocoaError(.fileNoSuchFile) }
+            try fm.createDirectory(at: to, withIntermediateDirectories: true)
+            for name in testFiles {
+                let source = from.appendingPathComponent(name), target = to.appendingPathComponent(name)
+                try? fm.removeItem(at: target)
+                if fm.fileExists(atPath: source.path) { try fm.copyItem(at: source, to: target) }
+            }
+            try? fm.removeItem(at: test.directory.appendingPathComponent("resume.hsnap.part"))
+            let saved = fm.fileExists(atPath: to.appendingPathComponent("resume.hsnap").path)
+            HengeLog.log("autopilot", "baseline \(store ? "store" : "load") \(name): done, \(saved ? "with" : "without") a saved Mac")
+        } catch {
+            HengeLog.log("autopilot", "baseline \(store ? "store" : "load") \(name): \(error.localizedDescription)")
         }
     }
 }

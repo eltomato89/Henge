@@ -286,6 +286,12 @@ final class Machines: ObservableObject {
         save()
     }
 
+    /// Off the list; its files are the caller's to remove.
+    func forget(_ mac: VirtualMac) {
+        all.removeAll { $0.id == mac.id }
+        save()
+    }
+
     func update(_ mac: VirtualMac) {
         guard let i = all.firstIndex(where: { $0.id == mac.id }) else { return }
         all[i] = mac
