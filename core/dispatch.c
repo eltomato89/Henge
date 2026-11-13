@@ -123,8 +123,6 @@ static void block_dump(const HvBlock *b, const uint32_t *code) {
     pthread_mutex_unlock(&mu);
 }
 
-static void census_translated(uint64_t va, uint64_t pa, uint32_t flags); /* HV_FLUSH_CENSUS, below */
-
 static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, const uint32_t *code, uint32_t avail) {
     HvMachine *m = cpu->m;
     uint32_t j = (uint32_t)((va >> 2) ^ (va >> 18) ^ ((uint64_t)flags << 13)) & ((1u << HV_JC_BITS) - 1);
@@ -172,7 +170,6 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
         m->stats.translate_ticks += mach_absolute_time() - t0;
         m->stats.translated_insns += nb.ninsns;
     }
-    census_translated(va, pa, flags);
     /* ...and place it in the region (space is reserved atomically, so no lock either)... */
     size_t used0 = m->jit.used;
     if (hv_translate_place(m, &nb) != 0) { /* JIT region full: start over */
@@ -872,38 +869,6 @@ static void wait_while_off(HvCpu *cpu) {
 
 /* HV_FLUSH_CENSUS=1 (measuring): what the code cache held when it filled, to see why it fills. Counted with
    every CPU stopped, just before the blocks go; takes a moment for millions of blocks. */
-/* The blocks the cache held at its last drop (hashes of va, pa and flags, sorted), and which of them have been
-   translated again since: how much of a full cache is still wanted afterwards. */
-static uint64_t *census_prev;
-static uint8_t *census_back;
-static uint32_t census_nprev;
-static uint64_t census_made, census_made_back;
-static inline uint64_t census_hash(uint64_t va, uint64_t pa, uint32_t flags) {
-    uint64_t h = (va ^ (uint64_t)flags << 60) * 0x9e3779b97f4a7c15ull ^ pa * 0xc2b2ae3d27d4eb4full;
-    return h ^ h >> 31;
-}
-static int census_u64(const void *a, const void *b) {
-    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
-    return x < y ? -1 : x > y;
-}
-/* A block was just translated: was it in the cache before the last drop? Any CPU, no lock. */
-static void census_translated(uint64_t va, uint64_t pa, uint32_t flags) {
-    const uint64_t *prev = __atomic_load_n(&census_prev, __ATOMIC_ACQUIRE);
-    if (!prev) return;
-    __atomic_add_fetch(&census_made, 1, __ATOMIC_RELAXED);
-    uint64_t h = census_hash(va, pa, flags);
-    uint32_t lo = 0, hi = census_nprev;
-    while (lo < hi) {
-        uint32_t mid = lo + (hi - lo) / 2;
-        if (prev[mid] < h) lo = mid + 1;
-        else hi = mid;
-    }
-    if (lo < census_nprev && prev[lo] == h) {
-        __atomic_add_fetch(&census_made_back, 1, __ATOMIC_RELAXED);
-        __atomic_store_n(&census_back[lo], 1, __ATOMIC_RELAXED);
-    }
-}
-
 typedef struct { uint64_t k1, k2; } CensusKey; /* k1: pa << 8 | instructions - 1; k2: va | flags << 60 */
 static int census_cmp(const void *a, const void *b) {
     const CensusKey *x = a, *y = b;
@@ -915,28 +880,6 @@ static void census(HvMachine *m) {
     uint32_t n = (uint32_t)m->nblocks;
     if (!on || n < 1000) return;
     uint64_t t0 = mach_absolute_time();
-    if (census_prev) { /* every CPU is stopped: nobody is in census_translated */
-        uint64_t back = 0;
-        for (uint32_t i = 0; i < census_nprev; i++) back += census_back[i];
-        fprintf(stderr, "hengevm: census: since the last drop %llu blocks were translated, %llu of them (%.1f%%) had been in the cache before it; "
-                        "of the %u distinct blocks that cache held, %llu (%.1f%%) were wanted again\n",
-                (unsigned long long)census_made, (unsigned long long)census_made_back, 100.0 * census_made_back / (census_made + 1e-9),
-                census_nprev, (unsigned long long)back, 100.0 * back / (census_nprev + 1e-9));
-        free(census_prev), free(census_back);
-        census_prev = NULL, census_back = NULL;
-    }
-    census_made = census_made_back = 0;
-    uint64_t *hs = malloc((size_t)n * sizeof *hs);
-    if (hs) {
-        for (uint32_t i = 0; i < n; i++) hs[i] = census_hash(m->blocks[i].va, m->blocks[i].pa, m->blocks[i].flags);
-        qsort(hs, n, sizeof *hs, census_u64);
-        uint32_t u = 0;
-        for (uint32_t i = 0; i < n; i++) if (!i || hs[i] != hs[i - 1]) hs[u++] = hs[i];
-        census_back = calloc(u, 1);
-        census_nprev = u;
-        if (census_back) __atomic_store_n(&census_prev, hs, __ATOMIC_RELEASE);
-        else free(hs);
-    }
     CensusKey *k = malloc((size_t)n * sizeof *k);
     if (!k) return;
     uint64_t stale = 0, insns = 0, by_flags[16] = {0}, where[3] = {0}; /* where: kernel, the shared region, other user */
