@@ -546,7 +546,7 @@ static void henge_ios_hold_high(void)
     }
 }
 
-static void henge_ios_release_high_hold(void)
+HENGE_EXPORT void henge_ios_release_high_hold(void)
 {
     if (g_high_hold_given) return;
     for (int i = 0; i < 3; i++)
