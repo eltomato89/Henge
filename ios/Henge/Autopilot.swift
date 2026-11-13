@@ -21,6 +21,7 @@ import UIKit
 ///   balloon MB         ask the Mac for that much of its memory back (HV_BALLOON set), log what it gave
 ///   snap [NAME]        the Mac's screen (1920x1080) into Documents/NAME.jpg (snap.jpg)
 ///   testmac            a copy of the Mac used last, called Test, to measure with (an older Test is replaced)
+///   testmac remove     Test and every kept baseline, gone
 ///   save               stop the running Mac where it is and write it out (instant resume's file); then exit
 ///   baseline store NAME, baseline load NAME   keep Test's disk and saved Mac as NAME, or put them back, while no
 ///                      Mac runs: with HV_RESUME_TEST set, "mac Test" then picks up exactly there, every time
@@ -163,7 +164,7 @@ enum Autopilot {
             HengeLog.log("autopilot", "tl: \(app.name) returned \(rc) \(why)")
             for line in text.prefix(4000).split(separator: "\n").prefix(40) { HengeLog.log("tl-out", String(line)) }
         case "testmac":
-            testMac()
+            if arg == "remove" { removeTestMac() } else { testMac() }
         case "save":
             await Task.detached { InstantResume.saveNow() }.value
         case "baseline":
@@ -219,6 +220,22 @@ enum Autopilot {
             try? fm.removeItem(at: test.directory)
             HengeLog.log("autopilot", "testmac: \(error.localizedDescription)")
         }
+    }
+
+    @MainActor private static func removeTestMac() {
+        let fm = FileManager.default
+        guard henge_vm_state() != 1, henge_vm_state() != 4 else { HengeLog.log("autopilot", "testmac remove: a Mac is running"); return }
+        let all: [VirtualMac] = Machines.shared.all
+        var removed = 0
+        for old in all where old.name == testName {
+            try? fm.removeItem(at: old.directory)
+            Machines.shared.forget(old)
+            removed += 1
+        }
+        let kept = (try? fm.contentsOfDirectory(atPath: baselines.path))?.count ?? 0
+        try? fm.removeItem(at: baselines)
+        let names = (Machines.shared.all as [VirtualMac]).map(\.name)
+        HengeLog.log("autopilot", "testmac remove: \(removed) Test Mac(s) and \(kept) baseline(s) removed; Macs left: \(names)")
     }
 
     @MainActor private static func baseline(store: Bool, name: String) {
