@@ -13,12 +13,13 @@ DECLARE_PROGRAM(pcrel);
 DECLARE_PROGRAM(long_block);
 DECLARE_PROGRAM(pstate_bits);
 DECLARE_PROGRAM(pac);
+DECLARE_PROGRAM(hop);
 extern const char jit_programs_begin[], jit_programs_finish[];
 
 static const TestProgram programs[] = {
     TEST_PROGRAM(arith),   TEST_PROGRAM(loop),   TEST_PROGRAM(condbr),
     TEST_PROGRAM(csel_ops), TEST_PROGRAM(bl_sub), TEST_PROGRAM(simd_fp),
-    TEST_PROGRAM(stolen),  TEST_PROGRAM(pcrel),  TEST_PROGRAM(long_block), TEST_PROGRAM(pstate_bits),
+    TEST_PROGRAM(stolen),  TEST_PROGRAM(pcrel),  TEST_PROGRAM(long_block), TEST_PROGRAM(pstate_bits), TEST_PROGRAM(hop),
 };
 
 int main(void) {
@@ -62,7 +63,8 @@ int main(void) {
         seed_cpu(&init, 99, sp);
         for (int r = 0; r < 31; r++) init.x[r] = r & 1 ? 0xfffffe0007123450ull + r * 8 : 0x100004000ull + r * 8;
         int bad = run_jit(&m, &pac_prog, &init, &jit, NULL);
-        HvCpu want = init;
+        static HvCpu want;
+        want = init;
         want.x[4] = 0;
         want.x[9] = init.x[30];  /* RETAB came back here, so x30 was restored */
         want.x[10] = init.x[30];
@@ -89,6 +91,40 @@ int main(void) {
             failed += bad != 0;
         }
         printf("with a 1 KB JIT region: %llu flushes\n", (unsigned long long)small.stats.block_flushes);
+    }
+    /* Again with the code cache a ring of two 32 KB segments (whatever HV_JIT_SEGMENTS says), the programs' pages
+       invalidated after every round so they are translated again and the ring comes round about once a round:
+       segments taken back in the middle of programs, with exits chained into their blocks from blocks that stay. */
+    {
+        static HvMachine ring;
+        if (hv_machine_init(&ring, 64 << 10) != 0) return 1;
+        hv_jit_ring(&ring.jit, 2);
+        hv_machine_add_ram(&ring, (uint64_t)(uintptr_t)jit_programs_begin, jit_programs_finish - jit_programs_begin,
+                           (void *)jit_programs_begin, 1);
+        hv_machine_add_ram(&ring, (uint64_t)(uintptr_t)stack, 65536, stack, 0);
+        int bad_rounds = 0;
+        for (int round = 0; round < 64; round++) {
+            for (size_t i = 0; i < count; i++) {
+                static HvCpu init, native, jit;
+                memset(&init, 0, sizeof init);
+                seed_cpu(&init, i * 2 + 1 + (size_t)round, sp);
+                run_native(&programs[i], &init, &native, NULL);
+                int bad = run_jit(&ring, &programs[i], &init, &jit, NULL);
+                if (!bad) bad = compare_cpus(programs[i].name, &native, &jit);
+                if (bad) printf("%-12s with a ring, round %d: FAIL\n", programs[i].name, round);
+                bad_rounds += bad != 0;
+            }
+            uint64_t from = (uint64_t)(uintptr_t)jit_programs_begin & ~16383ull, to = (uint64_t)(uintptr_t)jit_programs_finish;
+            for (uint64_t pa = from; pa < to; pa += 16384) hv_invalidate_code(&ring, pa < (uint64_t)(uintptr_t)jit_programs_begin ? (uint64_t)(uintptr_t)jit_programs_begin : pa);
+        }
+        printf("with a 64 KB ring of %u segments: %llu evictions (%llu blocks dropped, %llu exits unchained), %llu full flushes\n",
+               ring.jit.nseg, (unsigned long long)ring.stats.evictions, (unsigned long long)ring.stats.evict_blocks,
+               (unsigned long long)ring.stats.evict_unchained, (unsigned long long)ring.stats.block_flushes);
+        if (!ring.stats.evictions || !ring.stats.evict_unchained || ring.stats.block_flushes) {
+            printf("ring: expected evictions that undo chained exits, and no full flush: FAIL\n");
+            bad_rounds++;
+        }
+        failed += bad_rounds;
     }
     printf("%zu programs x 2 seeds, %d failures, %d blocks translated\n", count, failed, m.nblocks);
     return failed != 0;

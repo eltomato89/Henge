@@ -10,8 +10,11 @@ int hv_run(HvCpu *cpu);
 /* Runs a single block (after interrupt checks). */
 int hv_run_one(HvCpu *cpu);
 
-/* Drops every translated block (the JIT region is reused from the start). */
+/* Drops every translated block (the JIT region is reused from the start). Every CPU stopped. */
 void hv_flush_blocks(HvMachine *m);
+/* Takes back the oldest segment of the code cache (ring): drops the blocks there and undoes the exits chained into
+   them; the rest stay. A full flush when there is no ring or it cannot make room. Every CPU stopped. */
+void hv_evict_blocks(HvMachine *m);
 
 void hv_enter(HvCpu *cpu, void *block);
 /* While hv_run runs, the host FPCR/FPSR hold the guest's; these move them in and out. */

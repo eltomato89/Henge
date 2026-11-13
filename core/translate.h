@@ -38,6 +38,9 @@ int hv_translate_block(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t 
    translation lock). place returns -1 if the region is full. */
 int hv_translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t avail);
 int hv_translate_place(HvMachine *m, HvBlock *b);
+uint32_t hv_translate_placed_seg(void);
+void hv_translate_discard_slots(HvMachine *m);
+int hv_translate_commit_slots(HvMachine *m);
 uint32_t hv_translate_last_words(void);
 
 int hv_branch_retarget(uint32_t *w, int64_t off);

@@ -59,6 +59,22 @@ PROGRAM loop
     b.lt 2b
 END loop
 
+// Hundreds of one-branch blocks, run three times round: under a small code cache
+// (test_jit's ring) segments are taken back while the blocks in the others still
+// have exits chained into them, the back edge included.
+PROGRAM hop
+    mov x0, #0
+    mov x5, #3
+0:
+    .rept 300
+    add x0, x0, #1
+    b 1f
+1:
+    .endr
+    subs x5, x5, #1
+    b.ne 0b
+END hop
+
 PROGRAM condbr
     mov x0, #0
     mov x1, #5

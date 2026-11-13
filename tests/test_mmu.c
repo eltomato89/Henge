@@ -357,7 +357,7 @@ int main(void) {
         for (uint32_t i = 0; i < 4; i++) {
             uint32_t idx = base + i, pg = pages[i];
             m.slots[idx] = 0x1000 + i;
-            m.slot_site[idx] = NULL;
+            m.slot_site[idx] = 0;
             m.slot_xpa[idx] = (r->pa + ((uint64_t)pg << 14)) | 1;
             m.slot_xnext[idx] = r->xhead[pg];
             r->xhead[pg] = idx + 1;

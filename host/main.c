@@ -136,13 +136,8 @@ static void prof_sample(thread_act_t th) {
     pthread_mutex_lock(&prof_mu);
     prof_total++;
     if (pc >= hm->jit.base && pc < hm->jit.base + hm->jit.capacity && hm->nblocks) {
-        int lo = 0, hi = hm->nblocks - 1;
-        while (lo < hi) {
-            int mid = (lo + hi + 1) / 2;
-            if (hm->blocks[mid].code && hm->blocks[mid].code <= pc) lo = mid;
-            else hi = mid - 1;
-        }
-        HvBlock *b = &hm->blocks[lo];
+        HvBlock *b = hv_block_at(hm, pc);
+        if (!b) b = &hm->blocks[0];
         int el = (b->flags & HV_BLOCK_EL1) ? 1 : 0;
         {
             ptrdiff_t off = b->code && pc >= b->code ? pc - b->code : -1;
@@ -880,7 +875,7 @@ static void *watch_thread(void *unused) {
         const uint8_t *page = hv_pvg_lite_display_page(board.pvg);
         fprintf(stderr, "hengevm: watch %ld s: swaps %u on %u;", (long)(time(NULL) - start), page ? *(const volatile uint32_t *)(page + 0xf98) : 0, page ? *(const volatile uint32_t *)(page + 0xfb0) : 0);
         for (int i = 0; i < ncpus; i++) fprintf(stderr, " %llx@%u", (unsigned long long)hv_vm_cpu(i)->pc, hv_vm_cpu(i)->el);
-        { HvMachine *wm = hv_vm_machine(); fprintf(stderr, " | jit %llu MB, flushes %llu, ic %llu, code writes %llu", (unsigned long long)wm->jit.used * 4 >> 20, (unsigned long long)wm->stats.block_flushes, (unsigned long long)wm->stats.flush_ic, (unsigned long long)wm->stats.flush_smc);
+        { HvMachine *wm = hv_vm_machine(); fprintf(stderr, " | jit %llu MB, flushes %llu, evictions %llu, ic %llu, code writes %llu", (unsigned long long)hv_jit_extent(&wm->jit) * 4 >> 20, (unsigned long long)wm->stats.block_flushes, (unsigned long long)wm->stats.evictions, (unsigned long long)wm->stats.flush_ic, (unsigned long long)wm->stats.flush_smc);
           fprintf(stderr, " (cpu %llu dma %llu), %llu translations, blocks now %u; top:", (unsigned long long)hv_smc_cpu, (unsigned long long)hv_smc_dma, (unsigned long long)wm->stats.translations, (unsigned)wm->nblocks);
           uint32_t seen = 0; uint64_t distinct = 0; (void)seen;
           uint64_t best[4] = {0}; uint32_t bestn[4] = {0};

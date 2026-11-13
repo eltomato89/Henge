@@ -91,6 +91,31 @@ void hv_jit_finish(HvJitRegion *region, uint32_t *start, size_t words) {
     if (start && words) sys_icache_invalidate(start, words * sizeof(uint32_t));
 }
 
+void hv_jit_finish_words(HvJitRegion *region, uint32_t *const *words, size_t n) {
+    (void)region;
+#if TARGET_OS_OSX
+    if (!region->rw_diff) pthread_jit_write_protect_np(1);
+#endif
+    __asm__ volatile("dsb ish" ::: "memory");
+    uintptr_t last = 0;
+    for (size_t k = 0; k < n; k++) {
+        uintptr_t a = (uintptr_t)words[k] & ~(uintptr_t)63;
+        if (a == last) continue;
+        last = a;
+        __asm__ volatile("ic ivau, %0" ::"r"(a) : "memory");
+        if (k % 20 == 19) __asm__ volatile("dsb ish" ::: "memory"); /* as sys_icache_invalidate does, for the CPUs that need it */
+    }
+    __asm__ volatile("dsb ish\n\tisb" ::: "memory");
+}
+
+void hv_jit_poison(HvJitRegion *region, uint32_t *start, size_t words) {
+#if TARGET_OS_OSX
+    if (!region->rw_diff) pthread_jit_write_protect_np(0); /* MAP_JIT: a direct write faults until this */
+#endif
+    memset((uint8_t *)start + region->rw_diff, 0, words * sizeof(uint32_t));
+    hv_jit_finish(region, start, words);
+}
+
 /* As sys_icache_invalidate does it (libsystem_platform: DSB, IC IVAU per 64-byte line with a DSB after every 20 for
    the CPUs that need one, DSB, ISB), over both ranges. */
 static void ic_lines(uint32_t *start, size_t words, int *n) {
@@ -123,15 +148,68 @@ void hv_jit_finish_branch(HvJitRegion *region, uint32_t *word) {
     __asm__ volatile("dsb ish\n\tic ivau, %0" ::"r"((uintptr_t)word & ~(uintptr_t)63) : "memory");
 }
 
+static size_t region_cap(const HvJitRegion *region) {
+    return region->limit && region->limit < region->capacity ? region->limit : region->capacity;
+}
+
 /* Any thread: an even number of words (blocks stay 8-byte aligned), taken atomically. */
 uint32_t *hv_jit_reserve(HvJitRegion *region, size_t words) {
     words = (words + 1) & ~(size_t)1;
-    size_t at = __atomic_fetch_add(&region->used, words, __ATOMIC_RELAXED);
-    size_t cap = region->limit && region->limit < region->capacity ? region->limit : region->capacity;
-    if (at + words > cap) return NULL; /* full: the flush resets used */
-    return region->base + at;
+    size_t seg = region->seg_words;
+    if (!seg) {
+        size_t at = __atomic_fetch_add(&region->used, words, __ATOMIC_RELAXED);
+        if (at + words > region_cap(region)) return NULL; /* full: the flush resets used */
+        return region->base + at;
+    }
+    if (words > seg) {
+        region->too_big = 1;
+        return NULL;
+    }
+    /* Within one segment, so taking a segment back never splits a reservation (a CPU's chunk). */
+    size_t at = __atomic_load_n(&region->used, __ATOMIC_RELAXED), to;
+    do {
+        to = at;
+        if (to / seg != (to + words - 1) / seg) to = (to / seg + 1) * seg;
+        if (to + words > region->end) return NULL; /* full: hv_jit_evict_next makes room */
+    } while (!__atomic_compare_exchange_n(&region->used, &at, to + words, 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED));
+    return region->base + to;
 }
 
 void hv_jit_reset(HvJitRegion *region) {
     region->used = 0;
+    region->wrapped = 0;
+    region->too_big = 0;
+    region->end = (size_t)region->seg_words * region->nseg;
+    for (uint32_t k = 0; k < HV_JIT_MAX_SEGS; k++) region->seg_epoch[k]++;
+}
+
+void hv_jit_ring(HvJitRegion *region, uint32_t nseg) {
+    if (nseg > HV_JIT_MAX_SEGS) nseg = HV_JIT_MAX_SEGS;
+    size_t seg = nseg >= 2 ? (region_cap(region) / nseg) & ~(size_t)1 : 0;
+    if (seg < 2048) seg = 0, nseg = 0; /* under 8 KB a segment holds too few blocks to be worth keeping the rest */
+    region->seg_words = seg;
+    region->nseg = nseg;
+    hv_jit_reset(region);
+}
+
+uint32_t hv_jit_evict_next(HvJitRegion *region) {
+    size_t seg = region->seg_words, total = seg * region->nseg;
+    uint32_t k;
+    if (region->end >= total) { /* the last segment is in use: round to the first */
+        k = 0;
+        region->used = 0;
+        region->wrapped = 1;
+    } else {
+        k = (uint32_t)(region->end / seg);
+        region->used = region->end; /* past what reservations that failed added */
+    }
+    region->end = (k + 1) * seg;
+    region->seg_epoch[k]++;
+    return k;
+}
+
+size_t hv_jit_extent(const HvJitRegion *region) {
+    if (region->wrapped) return (size_t)region->seg_words * region->nseg;
+    size_t used = region->used, cap = region_cap(region);
+    return used < cap ? used : cap;
 }
