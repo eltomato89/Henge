@@ -42,6 +42,11 @@ Two-finger scrolling on a Magic Keyboard trackpad or a mouse wheel used to arriv
 - The fingers start at the far edge of the virtual pad. When they reach the other side, they rest briefly before re-gripping, so macOS doesn't start momentum or speed up partway through a long swipe.
 - **Settings → Mouse and Trackpad → Reverse scrolling** and **Scroll speed** still apply.
 
+### Steady clicks on a hardware trackpad
+Pressing a Magic Keyboard trackpad rolls the finger a little. iPadOS reports that roll as motion, so the Mac's pointer jumped a few pixels just as a click arrived. A Mac's own trackpad ignores this, and now Henge does too:
+- **Before a press:** a nudge of up to 6 px in the last 60 ms before the press is taken back.
+- **While a button is down:** motion is held until it passes 8 px. Past that, it's a drag and the held motion is sent. Released before that, it was a wobble and is dropped.
+
 ### The iPad's battery in macOS
 The Mac sees the iPad's battery as a USB UPS (a HID power device on a third xHCI port). macOS shows its charge, whether it's charging, and whether it's on power in the menu bar and in System Settings → Battery. It can use its normal UPS settings to shut down when the iPad runs low.
 
