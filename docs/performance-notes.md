@@ -49,6 +49,19 @@ time translating takes. The assumption behind them, that self-modifying code was
 the census shows almost no stale blocks. The "again" percentages in the stats line were what suggested it; they
 come from a bitmap that is never cleared and saturates, and should not be read that way.
 
+## Afterwards (14 November)
+
+The two changes above and the census were taken out again (reverted): they did not help, and upstream's open
+PR #177 (with #132 and #145) changes the same code. #177 is merged here instead: the code cache is a ring of 8
+segments and a full cache loses only its oldest one, which is point 2 below. Also merged: #152 (compiled Metal
+pipelines kept across launches), #133 (the Metal driver crash listed under loose ends is very likely this one: an
+ended guest process's GPU functions reaching a new one) and #141 (the CPUs choice follows the device's cores).
+None of these has been measured on the iPad yet. The census is in the history (commits aaf9c89, 9b12892) if it is
+needed again. With #177 merged, `tests/test_jit` and `tests/test_mem` pass on the Mac again.
+
+One bug of this fork's own was found on the way: the "code cache dropped" log line did floating-point arithmetic
+with the guest's FPSR in the host register and left its inexact flag set in the guest. Fixed in the #177 merge.
+
 ## What the numbers point to next
 
 In order of expected effect:
