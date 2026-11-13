@@ -28,12 +28,6 @@ typedef struct HvRam {
        so its code changing unchains just those (it scanned every such exit, under the translation lock: 2.3% of the
        phone's busy time at a login, and the other CPUs waited for the lock). */
     uint32_t *xhead;
-    /* Per page: where its translated code lies, a bit per 256 bytes (hv_code_written). A write to a code page that
-       touches none of it changes no translation, so nothing is dropped: programs that make code as they run (a
-       JavaScript engine) write new code beside code that is running, and dropping the whole page each time meant
-       translating the same blocks over and over (and the code cache filling with the dropped ones). */
-    uint64_t *code_map;
-    uint16_t *code_spared; /* per page: such writes let through since its translations were last dropped */
     size_t npages;
 } HvRam;
 
@@ -76,8 +70,6 @@ typedef struct HvBlock {
 typedef struct HvStats {
     uint64_t blocks, translations, block_flushes;
     uint64_t flush_smc, flush_ic, flush_full;  /* why translations were dropped */
-    uint64_t code_spared;     /* writes to a code page that touched none of its translated code: nothing dropped */
-    uint64_t code_respun;     /* translations made again because their code changed as they were made */
     uint64_t chained, ijc_fills, ijc_resets;
     uint64_t xchained;
     uint64_t kick_src[5];     /* exit_req set by: a request (TLBI), hv_cpu_wake, kick_all, hv_machine_wake, the CPU itself */        /* of them, exits to another page (TLB-checked) */
@@ -341,14 +333,6 @@ extern uint64_t *hv_smc_last;
 extern uint64_t hv_smc_pages, hv_smc_cpu, hv_smc_dma;
 /* A device wrote guest memory directly: translations made from it are out of date. Any thread. */
 void hv_dma_written(HvMachine *m, uint64_t pa, uint64_t len);
-/* The bits of a page's code map for `len` bytes from offset `off` in the page. */
-static inline uint64_t hv_code_bits(uint64_t off, uint64_t len) {
-    uint64_t first = off >> 8, last = (off + (len ? len : 1) - 1) >> 8;
-    if (last > 63) last = 63;
-    return (~0ull >> (63 - (last - first))) << first;
-}
-/* `len` bytes at pa (in one page) are being written: drops the page's translations if they may hold any of them. */
-void hv_code_written(HvMachine *m, HvRam *r, uint64_t pa, uint64_t len);
 HvMmio *hv_mmio_lookup(HvMachine *m, uint64_t pa);
 /* Host pointer for `len` bytes of guest RAM at pa, or NULL. */
 void *hv_phys_ptr(HvMachine *m, uint64_t pa, uint64_t len);

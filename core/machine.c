@@ -433,9 +433,7 @@ int hv_machine_add_ram(HvMachine *m, uint64_t pa, uint64_t size, void *host, int
     r->whint = calloc(pages * HV_MAX_CPUS, sizeof *r->whint);
     r->ijc_va = calloc(pages, sizeof *r->ijc_va);
     r->xhead = calloc(pages, sizeof *r->xhead);
-    r->code_map = calloc(pages, sizeof *r->code_map);
-    r->code_spared = calloc(pages, sizeof *r->code_spared);
-    return r->code_pages && r->page_gen && r->whint && r->ijc_va && r->xhead && r->code_map && r->code_spared ? 0 : -1;
+    return r->code_pages && r->page_gen && r->whint && r->ijc_va && r->xhead ? 0 : -1;
 }
 
 int hv_machine_add_mmio(HvMachine *m, uint64_t pa, uint64_t size, void *opaque,
@@ -468,8 +466,6 @@ void hv_invalidate_code(HvMachine *m, uint64_t pa) {
        finish with the old code, as it would with a real instruction pipeline. */
     r->code_pages[pg] = 0;
     __atomic_add_fetch(&r->page_gen[pg], 1, __ATOMIC_SEQ_CST);
-    __atomic_store_n(&r->code_map[pg], 0, __ATOMIC_SEQ_CST); /* after the generation: a block marked from here on is stale or new */
-    r->code_spared[pg] = 0;
     m->stats.flush_smc++;
     if (hv_smc_counts && pg < hv_smc_pages) {
         hv_smc_counts[pg]++;
@@ -531,38 +527,12 @@ void hv_invalidate_code(HvMachine *m, uint64_t pa) {
     hv_machine_kick_all(m);
 }
 
-/* HV_CODE_MAP=0: as before, any write to a code page drops all its translations. */
-static int code_map_on(void) {
-    static int v = -1;
-    if (v < 0) v = !(getenv("HV_CODE_MAP") && !atoi(getenv("HV_CODE_MAP")));
-    return v;
-}
-
-/* A page that is written beside its code this many times without its code changing is taken for data that shares a
-   page with code seldom run: its translations go, and with them the slow path every write to it takes. */
-#define HV_CODE_SPARED_MAX 1024
-
-void hv_code_written(HvMachine *m, HvRam *r, uint64_t pa, uint64_t len) {
-    uint64_t off = pa - r->pa, pg = off >> HV_TLB_PAGE_BITS;
-    if (!__atomic_load_n(&r->code_pages[pg], __ATOMIC_ACQUIRE)) return;
-    uint64_t bits = hv_code_bits(off & ((1u << HV_TLB_PAGE_BITS) - 1), len);
-    if (!code_map_on() || (__atomic_load_n(&r->code_map[pg], __ATOMIC_SEQ_CST) & bits) || ++r->code_spared[pg] >= HV_CODE_SPARED_MAX) {
-        hv_invalidate_code(m, pa);
-        return;
-    }
-    m->stats.code_spared++;
-}
-
 void hv_dma_written(HvMachine *m, uint64_t pa, uint64_t len) {
     HvRam *r = hv_ram_lookup(m, pa);
     if (!r || !len || pa + len - r->pa > r->size) return;
     uint64_t first = (pa - r->pa) >> HV_TLB_PAGE_BITS, last = (pa + len - 1 - r->pa) >> HV_TLB_PAGE_BITS;
-    for (uint64_t pg = first; pg <= last; pg++) {
-        if (!__atomic_load_n(&r->code_pages[pg], __ATOMIC_ACQUIRE)) continue;
-        uint64_t lo = r->pa + (pg << HV_TLB_PAGE_BITS), hi = lo + (1u << HV_TLB_PAGE_BITS);
-        uint64_t from = pa > lo ? pa : lo, to = pa + len < hi ? pa + len : hi;
-        hv_code_written(m, r, from, to - from);
-    }
+    for (uint64_t pg = first; pg <= last; pg++)
+        if (__atomic_load_n(&r->code_pages[pg], __ATOMIC_ACQUIRE)) hv_invalidate_code(m, r->pa + (pg << HV_TLB_PAGE_BITS));
 }
 
 HvMmio *hv_mmio_lookup(HvMachine *m, uint64_t pa) {
@@ -604,14 +574,8 @@ int hv_phys_write(HvMachine *m, uint64_t pa, const void *buf, unsigned len) {
         if (r->readonly) return 0; /* ROM: writes are ignored */
         uint64_t off = pa - r->pa;
         uint64_t first = off >> HV_TLB_PAGE_BITS, last = (off + len - 1) >> HV_TLB_PAGE_BITS;
-#define CODE_WRITTEN() \
-        for (uint64_t pg = first; pg <= last; pg++) { \
-            if (!r->code_pages[pg]) continue; \
-            uint64_t lo = pg << HV_TLB_PAGE_BITS, hi = lo + (1u << HV_TLB_PAGE_BITS); \
-            uint64_t from = off > lo ? off : lo, to = off + len < hi ? off + len : hi; \
-            hv_code_written(m, r, r->pa + from, to - from); /* a write to a code page */ \
-        }
-        CODE_WRITTEN()
+        for (uint64_t pg = first; pg <= last; pg++)
+            if (r->code_pages[pg]) hv_invalidate_code(m, r->pa + (pg << HV_TLB_PAGE_BITS)); /* a write to code */
         if (m->watch_pa && m->watch_pa - pa < len) {
             uint64_t v = 0;
             memcpy(&v, (const uint8_t *)buf + (m->watch_pa - pa), len - (m->watch_pa - pa) < 8 ? len - (m->watch_pa - pa) : 8);
@@ -620,15 +584,6 @@ int hv_phys_write(HvMachine *m, uint64_t pa, const void *buf, unsigned len) {
                     (unsigned long long)m->access_pc);
         }
         memcpy(r->host + off, buf, len);
-        /* And again once it is written: a block translated from the old bytes in between has marked itself by now
-           (dispatch.c lookup marks, then compares), so one of the two sees the other. */
-        for (uint64_t pg = first; pg <= last; pg++) {
-            if (!r->code_pages[pg]) continue;
-            uint64_t lo = pg << HV_TLB_PAGE_BITS, hi = lo + (1u << HV_TLB_PAGE_BITS);
-            uint64_t from = off > lo ? off : lo, to = off + len < hi ? off + len : hi;
-            if (__atomic_load_n(&r->code_map[pg], __ATOMIC_SEQ_CST) & hv_code_bits(from - lo, to - from)) hv_invalidate_code(m, r->pa + from);
-        }
-#undef CODE_WRITTEN
         return 0;
     }
     HvMmio *d = hv_mmio_lookup(m, pa);
