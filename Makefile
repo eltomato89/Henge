@@ -272,3 +272,11 @@ $(B)/test_hardware_shortcuts: ios/Henge/HardwareShortcutMapper.swift tests/test_
 test-hardware-shortcuts: $(B)/test_hardware_shortcuts
 	$(B)/test_hardware_shortcuts
 .PHONY: test-hardware-shortcuts
+
+# Which disk sizes a Mac is offered, and when growing is refused.
+$(B)/test_disk_growth: ios/Henge/DiskGrowth.swift tests/test_disk_growth.swift | $(B)
+	xcrun --sdk macosx swiftc $^ -o $@
+
+test-disk-growth: $(B)/test_disk_growth
+	$(B)/test_disk_growth
+.PHONY: test-disk-growth

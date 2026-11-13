@@ -26,17 +26,16 @@
 
 ## What this fork adds
 
-### Choosable disk size
-The Mac's disk is no longer fixed at 64 GB. In a Mac's settings, **Storage → Disk size** grows `disk.img` in 16 GB steps up to 2 TB. It shows a warning when the device's free space is short. The image is sparse, so it takes only the space macOS actually writes. A disk can grow but never shrink.
+### Larger disks
+A stopped Mac's disk can be made larger: in a Mac's settings, **Make the Disk Larger…** offers sizes from 96 GB up to 2 TB. A disk can only grow, never shrink. The image is sparse, so it takes only the space macOS actually writes.
 
-After growing it, macOS still has to take the new space. Its APFS container can only grow into free space directly behind it, and the recovery container sits there. In Terminal on the Mac:
+This is upstream's [#139](https://github.com/Leviidev/Henge/pull/139), extended here from 256 GB to 2 TB. After growing the file, Henge moves the recovery partition to the new end of the disk and rewrites the partition table. Then one command in the Mac's Terminal is enough for macOS to use the space:
 
 ```bash
-diskutil list                                   # find the Apple_APFS_Recovery container (disk0s3)
-sudo diskutil apfs deleteContainer disk0s3      # remove it (or: eraseVolume free none disk0s3)
-sudo diskutil repairDisk disk0                  # move the GPT's backup header to the new end of the disk
-sudo diskutil apfs resizeContainer disk0s2 0    # grow the main container into all free space
+sudo diskutil apfs resizeContainer disk0s2 0
 ```
+
+This also works on a disk whose recovery container was deleted earlier: then only the partition table moves.
 
 ### Smooth trackpad scrolling on iPad
 Two-finger scrolling on a Magic Keyboard trackpad or a mouse wheel used to arrive as coarse wheel clicks, so a small swipe could jump far down a page. Now Henge plays it on the Mac's virtual Magic Trackpad 2 as two fingers moving, so macOS scrolls the way a real Mac trackpad does: pixel-smooth, with its own momentum and rubber-banding.
@@ -56,6 +55,7 @@ Built-in StikJIT looked up the device's RemotePairing port over Bonjour and took
 These open pull requests on Leviidev/Henge are merged here:
 - [#91](https://github.com/Leviidev/Henge/pull/91): **Microphone**. The Mac gets the device's microphone as a sound input (opt-in, Settings → Sound).
 - [#88](https://github.com/Leviidev/Henge/pull/88): **Pick the shared folder**. Serve any folder to the Mac instead of only the built-in one. Henge's own working files are never served.
+- [#139](https://github.com/Leviidev/Henge/pull/139): **Larger disks**. See above.
 - [#72](https://github.com/Leviidev/Henge/pull/72): **Mac shortcuts**. Optional Control-Tab, Control-Q and Control-Space for the app switcher, Quit and Spotlight (Settings → Keyboard).
 
 ### Building this fork
