@@ -206,8 +206,7 @@ private struct MacHero: View {
                         .padding(.horizontal, 5)
                         .padding(.top, 10)
                 }
-                Button("Turn On JIT", action: turnOnJIT)
-                    .buttonStyle(DeskButtonStyle())
+                TurnOnJITButton(action: turnOnJIT)
                     .padding(.top, 15)
             }
         }
@@ -262,5 +261,35 @@ struct NoticeRow: View {
         }
         .padding(14)
         .deskCard()
+    }
+}
+
+/// "Turn On JIT", which says so while JIT is being turned on: after a tap, and when Henge does it by itself as it
+/// opens. That takes several seconds (the helper starts, attaches, and the code region is claimed), and the button
+/// looked as if nothing had happened.
+struct TurnOnJITButton: View {
+    @ObservedObject private var jit = JITCoordinator.shared
+    let action: () -> Void
+
+    var body: some View {
+        VStack(spacing: 8) {
+            Button(action: action) {
+                if jit.busy {
+                    HStack(spacing: 10) {
+                        ProgressView().tint(Desk.dim)
+                        Text("Turning On JIT\u{2026}")
+                    }
+                } else {
+                    Text("Turn On JIT")
+                }
+            }
+            .buttonStyle(DeskButtonStyle(enabled: !jit.busy))
+            .disabled(jit.busy)
+            if jit.busy, let status = jit.status {
+                Text(status).font(.system(size: 13)).foregroundStyle(Desk.dim)
+                    .frame(maxWidth: .infinity, alignment: .center)
+            }
+        }
+        .animation(.easeOut(duration: 0.15), value: jit.busy)
     }
 }

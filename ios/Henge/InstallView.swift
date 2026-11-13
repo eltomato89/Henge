@@ -132,8 +132,7 @@ struct InstallView: View {
             .padding(.top, 10)
         if !jitReady && !Device.chipTooOld {
             // Before any Mac exists, this is the only place to ask for JIT (#23).
-            Button("Turn On JIT") { jit.enable() }
-                .buttonStyle(DeskButtonStyle())
+            TurnOnJITButton { jit.enable() }
                 .padding(.top, 12)
         }
     }
