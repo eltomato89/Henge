@@ -273,5 +273,40 @@ PROGRAM p_smc_beside
 5:
 END p_smc_beside
 
+// A loop that calls two subroutines elsewhere in its page and rewrites the first each time round: only that one's
+// translation may go, and the loop's jump to it must follow the new code.
+PROGRAM p_smc_far
+    mov x1, #0
+    mov x4, #0
+1:  bl 3f
+    add x1, x1, x0
+    bl 6f
+    add x1, x1, x0
+    adr x2, 3f
+    ldr w3, 4f
+    tst x4, #1
+    b.eq 2f
+    ldr w3, 8f
+2:  str w3, [x2]
+    dc cvau, x2
+    dsb ish
+    ic ivau, x2
+    dsb ish
+    isb
+    add x4, x4, #1
+    cmp x4, #50
+    b.lt 1b
+    b 9f
+4:  mov x0, #2
+8:  mov x0, #1
+    .space 1024 - (. - _p_smc_far)
+3:  mov x0, #1
+    ret
+    .space 2048 - (. - _p_smc_far)
+6:  mov x0, #16
+    ret
+9:
+END p_smc_far
+
     .p2align 14
 _exc_programs_finish:

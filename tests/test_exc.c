@@ -14,6 +14,7 @@ DECLARE_PROGRAM(p_psci);
 DECLARE_PROGRAM(p_smc);
 DECLARE_PROGRAM(p_smc_nomaint);
 DECLARE_PROGRAM(p_smc_beside);
+DECLARE_PROGRAM(p_smc_far);
 extern const char exc_programs_begin[], exc_programs_finish[];
 
 #define ACK_PA 0x20000000ull
@@ -178,12 +179,31 @@ int main(void) {
         memcpy(code, p->start, len);
         hv_dma_written(&m, ADDR(code), 16384); /* the page's code is another program's now */
         TestProgram copy = {p->name, NULL, code, code + ((const char *)p->end - (const char *)p->start)};
-        uint64_t spared0 = m.stats.code_spared, smc0 = m.stats.flush_smc, made0 = m.stats.translations;
+        uint64_t spared0 = m.stats.code_spared, smc0 = m.stats.flush_smc, made0 = m.stats.translations, chunk0 = m.stats.flush_chunk;
         if (!run(&copy, &c, 0)) {
             check(p->name, "100 calls of 1, then 2 after patching", c.x[1], 102);
             check(p->name, "the writes beside the code dropped nothing", m.stats.code_spared - spared0, 100);
-            check(p->name, "the write into the code dropped the page once", m.stats.flush_smc - smc0, 1);
+            check(p->name, "the write into the code dropped only the blocks around it, once", m.stats.flush_chunk - chunk0, 1);
+            check(p->name, "and not the page", m.stats.flush_smc - smc0, 0);
             check(p->name, "the loop was not translated again for each write", m.stats.translations - made0 < 20, 1);
+        }
+    }
+
+    { /* Code rewritten in place, called from elsewhere in its page. */
+        static const TestProgram far = TEST_PROGRAM(p_smc_far);
+        const TestProgram *p = &far;
+        size_t len = (const char *)p->end - (const char *)p->start + 4;
+        memset(code, 0, 16384);
+        memcpy(code, p->start, len);
+        hv_dma_written(&m, ADDR(code), 16384);
+        TestProgram copy = {p->name, NULL, code, code + ((const char *)p->end - (const char *)p->start)};
+        uint64_t smc0 = m.stats.flush_smc, made0 = m.stats.translations, chunk0 = m.stats.flush_chunk, un0 = m.stats.chunk_unchained;
+        if (!run(&copy, &c, 0)) {
+            check(p->name, "50 calls of 1 and 2 in turn, 50 of 16", c.x[1], 25 * 1 + 25 * 2 + 50 * 16);
+            check(p->name, "each rewrite dropped only the blocks around it", m.stats.flush_chunk - chunk0, 50);
+            check(p->name, "never the page", m.stats.flush_smc - smc0, 0);
+            check(p->name, "the loop's jump into the rewritten code was unchained each time but the last", m.stats.chunk_unchained - un0 >= 49, 1);
+            check(p->name, "only the rewritten subroutine was translated again", m.stats.translations - made0 < 50 + 20, 1);
         }
     }
 
