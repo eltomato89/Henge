@@ -360,7 +360,20 @@ final class HardwareMouse {
         let way: Float = reverse ? 1 : -1
         // Sensor units per GameController unit: about 40 at the default speed (0.3).
         let gain = way * ScrollFingers.unitsPerPoint * scale / 0.3
-        scrollFingers.move(dx: horizontalChanged ? second * gain : 0, dy: verticalChanged ? first * gain : 0)
+        scrollFingers.move(dx: horizontalChanged ? Self.fingerTravel(second) * gain : 0,
+                           dy: verticalChanged ? Self.fingerTravel(first) * gain : 0)
+    }
+}
+
+extension HardwareMouse {
+    /// iPadOS has already sped a fast swipe up: its values grow much faster than the fingers move (8 a sample and
+    /// more, where a slow scroll gives well under 1). Taken as they are, the Mac's fingers crossed the whole pad in
+    /// 10 ms, were lifted and put down again several times a swipe, and macOS took those short touches for
+    /// two-finger taps (two of them: Smart Zoom) and sped the scroll up a second time itself. So above 1 only the
+    /// square root counts: 8 becomes 2.8, about the 280 mm/s of a real fast swipe, and macOS does the speeding up.
+    static func fingerTravel(_ value: Float) -> Float {
+        let size = abs(value)
+        return size <= 1 ? value : (value < 0 ? -1 : 1) * size.squareRoot()
     }
 }
 
@@ -391,8 +404,17 @@ final class ScrollFingers {
     private static let mergeDelay: TimeInterval = 0.003
     /// How long the fingers rest at an edge before lifting, so macOS sees them stopped.
     private static let rest: TimeInterval = 0.05
+    /// Two fingers that touch and leave within this time without going this far are a two-finger tap to macOS, and
+    /// two of those a double tap: Smart Zoom in Safari and Chrome. A short scroll must not look like one, so fingers
+    /// that have hardly moved stay down until the time is up (a scroll that goes on meanwhile just continues).
+    private static let tapTime: TimeInterval = 0.35
+    private static let tapTravel: Float = 250 // sensor units, about 5 mm
+    private static let payStep: Float = 150   // most of the kept motion paid out per sample
 
     private var down = false
+    private var placedAt: CFTimeInterval = 0
+    private var travel: Float = 0
+    private var lateLift: DispatchWorkItem?
     private var x: Float = 0, y: Float = 0
     private var pendingX: Float = 0, pendingY: Float = 0
     private var flushScheduled = false
@@ -404,6 +426,8 @@ final class ScrollFingers {
     private static func now() -> UInt32 { UInt32(truncatingIfNeeded: Int(CACurrentMediaTime() * 1000)) }
 
     func move(dx: Float, dy: Float) {
+        lateLift?.cancel()
+        lateLift = nil
         pendingX += dx
         pendingY += dy
         if !flushScheduled {
@@ -425,7 +449,19 @@ final class ScrollFingers {
         backlogX = 0
         backlogY = 0
         flush()
-        lift()
+        guard down else { return }
+        let age = CACurrentMediaTime() - placedAt
+        if travel >= Self.tapTravel || age >= Self.tapTime {
+            lift()
+            return
+        }
+        lateLift?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.lateLift = nil
+            self?.lift()
+        }
+        lateLift = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + (Self.tapTime - age), execute: work)
     }
 
     private func flush() {
@@ -451,7 +487,9 @@ final class ScrollFingers {
         }
         // Pay out what was held back, a share each sample, on top of the new motion.
         if backlogX != 0 || backlogY != 0 {
-            let shareX = backlogX * 0.35, shareY = backlogY * 0.35
+            // A share at a time, and never faster than a quick finger: the whole of it at once crossed the pad again.
+            let shareX = max(-Self.payStep, min(Self.payStep, backlogX * 0.35))
+            let shareY = max(-Self.payStep, min(Self.payStep, backlogY * 0.35))
             dx += shareX
             dy += shareY
             backlogX -= shareX
@@ -463,7 +501,9 @@ final class ScrollFingers {
         let nx = x + dx, ny = y + dy
         if nx - Self.spread / 2 < Self.minX || nx + Self.spread / 2 > Self.maxX || ny < Self.minY || ny > Self.maxY {
             // The edge: rest here, keeping this sample's motion for after.
-            restingUntil = CACurrentMediaTime() + Self.rest
+            // Rest here; and fingers that came down only a moment ago stay until they can't be taken for a tap.
+            let now = CACurrentMediaTime()
+            restingUntil = max(now + Self.rest, placedAt + Self.tapTime)
             log("edge at \(Int(x)),\(Int(y)): resting")
             backlogX += dx
             backlogY += dy
@@ -472,6 +512,7 @@ final class ScrollFingers {
         }
         x = nx
         y = ny
+        travel += abs(dx) + abs(dy)
         frame(ts)
     }
 
@@ -497,6 +538,8 @@ final class ScrollFingers {
         henge_vm_touch(ids.0, 0, Int32(x - Self.spread / 2), Int32(y), ts)
         henge_vm_touch(ids.1, 0, Int32(x + Self.spread / 2), Int32(y), ts)
         down = true
+        placedAt = CACurrentMediaTime()
+        travel = 0
     }
 
     private func lift() {
